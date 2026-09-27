@@ -20,7 +20,7 @@ const SCM_PIDFD: libc::c_int = 4;
 const MAX_FRAME: usize = 300 * 1024;
 // A request can include a 60-second choice dialog and a separate 60-second
 // administrator challenge, plus bounded session checks and delivery.
-const TIMEOUT_SECONDS: libc::time_t = 180;
+const TIMEOUT_SECONDS: libc::c_int = 180;
 // Aligned storage, with room for credentials, a pidfd, and malicious SCM_RIGHTS.
 // Linux permits at most 253 SCM_RIGHTS descriptors in a message.
 const CONTROL_WORDS: usize = 256;
@@ -158,7 +158,8 @@ impl Channel {
             message.msg_iov = &mut iov;
             message.msg_iovlen = 1;
             message.msg_control = control.as_mut_ptr().cast();
-            message.msg_controllen = size_of_val(&control);
+            // musl uses socklen_t here, while glibc uses size_t.
+            message.msg_controllen = u32::try_from(size_of_val(&control))? as _;
             // SAFETY: all output buffers are live, writable, and correctly aligned.
             let received =
                 unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
@@ -172,7 +173,8 @@ impl Channel {
             // Adopt every delivered descriptor before examining payload or flags.
             // Even a truncated/invalid packet can carry descriptors we must close.
             // SAFETY: control came from recvmsg, and none of its fds were adopted yet.
-            let peer = unsafe { parse_peer(&control, message.msg_controllen, message.msg_flags) }?;
+            let peer =
+                unsafe { parse_peer(&control, message.msg_controllen as _, message.msg_flags) }?;
             if received == 0 || received as usize > MAX_FRAME {
                 bail!("empty or oversized IPC frame");
             }
@@ -355,7 +357,7 @@ fn configure_io(fd: RawFd) -> io::Result<()> {
         }
     }
     let timeout = libc::timeval {
-        tv_sec: TIMEOUT_SECONDS,
+        tv_sec: TIMEOUT_SECONDS.into(),
         tv_usec: 0,
     };
     set_option(fd, libc::SO_RCVTIMEO, &timeout)?;
@@ -386,11 +388,13 @@ unsafe fn parse_peer(control: &[usize], length: usize, flags: libc::c_int) -> io
                     .cast::<libc::cmsghdr>(),
             )
         };
-        if header.cmsg_len < header_length || header.cmsg_len > length - offset {
+        // Linux libc exposes this as either socklen_t or size_t; both fit usize.
+        let cmsg_length: usize = header.cmsg_len as _;
+        if cmsg_length < header_length || cmsg_length > length - offset {
             invalid = true;
             break;
         }
-        let data_length = header.cmsg_len - header_length;
+        let data_length = cmsg_length - header_length;
         // SAFETY: header and payload lengths were checked against the allocation.
         let data = unsafe { control.as_ptr().cast::<u8>().add(offset + header_length) };
         match (header.cmsg_level, header.cmsg_type) {
@@ -430,7 +434,7 @@ unsafe fn parse_peer(control: &[usize], length: usize, flags: libc::c_int) -> io
             _ => invalid = true,
         }
         let alignment = size_of::<usize>();
-        offset += (header.cmsg_len + alignment - 1) & !(alignment - 1);
+        offset += (cmsg_length + alignment - 1) & !(alignment - 1);
     }
     if invalid || credentials.is_none() || pidfds.len() != 1 {
         return Err(io::Error::new(
@@ -518,12 +522,15 @@ mod tests {
                     libc::MSG_NOSIGNAL,
                 )
             },
-            payload.len() as isize
+            payload.len() as isize,
+            "raw packet send failed: {}",
+            io::Error::last_os_error()
         );
     }
 
     fn push_control(control: &mut [usize], length: &mut usize, kind: i32, bytes: &[u8]) {
-        let space = unsafe { libc::CMSG_SPACE(bytes.len() as u32) } as usize;
+        let data_length = u32::try_from(bytes.len()).unwrap();
+        let space = unsafe { libc::CMSG_SPACE(data_length) } as usize;
         assert!(*length + space <= size_of_val(control));
         unsafe {
             let header = control
@@ -533,7 +540,7 @@ mod tests {
                 .cast::<libc::cmsghdr>();
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = kind;
-            (*header).cmsg_len = libc::CMSG_LEN(bytes.len() as u32) as usize;
+            (*header).cmsg_len = libc::CMSG_LEN(data_length) as _;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), libc::CMSG_DATA(header), bytes.len());
         }
         *length += space;
@@ -554,7 +561,7 @@ mod tests {
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = length;
+        message.msg_controllen = u32::try_from(length).unwrap() as _;
         assert_eq!(
             unsafe { libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL) },
             payload.len() as isize
@@ -674,14 +681,15 @@ mod tests {
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = size_of_val(&control);
+        message.msg_controllen = u32::try_from(size_of_val(&control)).unwrap() as _;
         assert_eq!(
             unsafe { libc::recvmsg(server.fd.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) },
             2
         );
         assert_ne!(message.msg_flags & libc::MSG_CTRUNC, 0);
         assert!(
-            unsafe { parse_peer(&control, message.msg_controllen, message.msg_flags) }.is_err()
+            unsafe { parse_peer(&control, message.msg_controllen as _, message.msg_flags) }
+                .is_err()
         );
         assert_eof(&read);
     }
@@ -702,6 +710,73 @@ mod tests {
         set_option(listener.fd.as_raw_fd(), SO_PASSPIDFD, &0_i32).unwrap();
         let _client = Channel::connect(&path).unwrap();
         assert!(listener.accept().is_err());
+    }
+
+    #[test]
+    fn malformed_ancillary_lengths_are_rejected() {
+        let mut control = [0_usize; CONTROL_WORDS];
+        // Initialize in zeroed storage, including musl's private header padding.
+        let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        for length in [
+            0,
+            unsafe { libc::CMSG_LEN(0) } - 1,
+            u32::try_from(size_of_val(&control)).unwrap() + 1,
+        ] {
+            unsafe { (*header).cmsg_len = length as _ };
+            let error = unsafe { parse_peer(&control, size_of_val(&control), 0) }.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+        // Exercise the native field maximum (u32 on musl, usize on glibc)
+        // without narrowing it before the parser's bounds check.
+        unsafe { (*header).cmsg_len = !0 };
+        let error = unsafe { parse_peer(&control, size_of_val(&control), 0) }.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn ancillary_bounds_and_flags_preserve_descriptor_ownership() {
+        for (flags, oversized) in [
+            (0, false),
+            (libc::MSG_TRUNC, false),
+            (libc::MSG_CTRUNC, false),
+            (0, true),
+        ] {
+            let mut control = [0_usize; CONTROL_WORDS];
+            let mut length = 0;
+            let credentials = libc::ucred {
+                pid: unsafe { libc::getpid() },
+                uid: unsafe { libc::getuid() },
+                gid: unsafe { libc::getgid() },
+            };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&credentials as *const libc::ucred).cast::<u8>(),
+                    size_of::<libc::ucred>(),
+                )
+            };
+            push_control(&mut control, &mut length, libc::SCM_CREDENTIALS, bytes);
+            let (read, write) = pipe();
+            // A synthetic owned fd lets EOF verify cleanup on both success and
+            // rejection; this test never polls it as a real pidfd.
+            let raw = write.into_raw_fd();
+            push_control(&mut control, &mut length, SCM_PIDFD, &raw.to_ne_bytes());
+            if oversized {
+                length = size_of_val(&control) + 1;
+            }
+            let result = unsafe { parse_peer(&control, length, flags) };
+            if flags == 0 && !oversized {
+                let peer = result.unwrap();
+                assert_eq!(
+                    (peer.pid, peer.uid, peer.gid),
+                    (credentials.pid, credentials.uid, credentials.gid)
+                );
+                assert_eq!(peer.pidfd.as_raw_fd(), raw);
+                drop(peer);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+            assert_eof(&read);
+        }
     }
 
     #[test]
@@ -873,7 +948,8 @@ mod tests {
                 message.msg_iov = &mut iov;
                 message.msg_iovlen = 1;
                 message.msg_control = control.as_mut_ptr().cast();
-                message.msg_controllen = size_of_val(&control);
+                // This fixed eight-word buffer fits either libc length field.
+                message.msg_controllen = size_of_val(&control) as _;
                 if libc::recvmsg(child_fd, &mut message, libc::MSG_CMSG_CLOEXEC) != 1 {
                     libc::_exit(10);
                 }

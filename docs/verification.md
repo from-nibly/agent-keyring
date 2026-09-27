@@ -2,9 +2,17 @@
 
 ## Automated
 
-The initial implementation passes 68 Rust tests, Clippy with warnings denied,
-Rustfmt, and ShellCheck. Ten consecutive parallel-suite runs were also used to
-check concurrency stability before the final pkcheck parser regression was added.
+The implementation passes 70 Rust tests on both GNU and musl, Clippy with
+warnings denied on GNU, Rustfmt, ShellCheck, and actionlint. The v0.1.0 tag's
+static build exposed libc-specific ancillary length types; v0.1.1 fixes those
+conversions and adds musl tests as a release gate. Local musl testing used Rust
+1.98.1; CI pins Rust 1.95.0 for both targets.
+
+Tests were run with a process-local umask of 077, matching the service's private
+file-creation policy. One earlier parallel run reported an undiagnosed raw
+packet-send failure. The assertion now includes errno; thirty subsequent full
+parallel GNU runs passed without reproducing it. No packet-size or truncation
+assertions were weakened.
 
 Coverage includes:
 
