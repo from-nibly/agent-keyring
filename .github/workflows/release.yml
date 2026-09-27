@@ -1,0 +1,80 @@
+name: Test and release
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust and static-build tools
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.95.0
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools shellcheck
+      - name: Check source and unit tests
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          shellcheck scripts/*.sh
+      - name: Build static Linux binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Package binary and system assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo 'Tag does not match Cargo.toml version' >&2
+            exit 1
+          fi
+          package="agent-keyring-v${version}-x86_64-unknown-linux-musl"
+          mkdir -p "dist/$package/bin" "dist/$package/share"
+          install -m755 target/x86_64-unknown-linux-musl/release/agent-keyring "dist/$package/bin/agent-keyring"
+          install -m755 scripts/install-system.sh "dist/$package/bin/agent-keyring-install-system"
+          cp -R share/agent-keyring "dist/$package/share/agent-keyring"
+          cp README.md LICENSE "dist/$package/"
+          epoch=$(git log -1 --format=%ct)
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -C dist -czf "dist/$package.tar.gz" "$package"
+          (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-release
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-release
+          path: dist
+      - name: Publish verified release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+            --verify-tag --title "agent-keyring $GITHUB_REF_NAME" --generate-notes

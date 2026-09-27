@@ -1,0 +1,13 @@
+/target/
+/result
+/result-*
+/.ai/
+/.lavish/
+/project-model/
+/codedb.snapshot
+# Workstation-specific research history, not part of the public distribution.
+/docs/proposal.md
+*.db
+*.db-shm
+*.db-wal
+.env

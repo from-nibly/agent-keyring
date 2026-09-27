@@ -1,0 +1,30 @@
+[Unit]
+Description=Process-scoped secret authorization for coding agents
+After=polkit.service systemd-logind.service
+Requires=polkit.service systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/agent-keyring daemon --zenity @ZENITY@
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=agent-keyring
+RuntimeDirectoryMode=0755
+StateDirectory=agent-keyring
+StateDirectoryMode=0700
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/agent-keyring /run/agent-keyring
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

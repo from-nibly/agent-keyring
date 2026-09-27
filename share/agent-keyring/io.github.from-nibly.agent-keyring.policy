@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>agent-keyring</vendor>
+  <vendor_url>https://github.com/from-nibly/agent-keyring</vendor_url>
+  <action id="io.github.from-nibly.agent-keyring.read">
+    <description>Approve process-scoped access to a secret</description>
+    <message>Administrator authentication is required to approve this agent-keyring secret request.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+  <action id="io.github.from-nibly.agent-keyring.replace">
+    <description>Replace a protected secret</description>
+    <message>Administrator authentication is required to replace this agent-keyring secret.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+  <action id="io.github.from-nibly.agent-keyring.delete">
+    <description>Delete a protected secret</description>
+    <message>Administrator authentication is required to delete this agent-keyring secret.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
