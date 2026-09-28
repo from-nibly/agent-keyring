@@ -7,8 +7,11 @@ only the unprivileged listener; its output never authorizes a request.
 
 Ubuntu 24.04 build dependencies: a C compiler and Make (`build-essential`),
 `libgtk-3-dev`, `libpolkit-agent-1-dev`, `pkg-config`, `xvfb`, and `xauth`
-(the latter is needed by Ubuntu's `xvfb-run`). No PAM development package or
-replacement authentication helper is needed.
+(the latter is needed by Ubuntu's `xvfb-run`). The headless runtime also needs
+`librsvg2-common`, `shared-mime-info`, and `adwaita-icon-theme` so GTK can decode
+its SVG radio-button assets. Missing loaders remain fatal test warnings; do not
+suppress them. No PAM development package or replacement authentication helper
+is needed.
 
 ```nu
 make -C gui all check

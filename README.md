@@ -108,7 +108,9 @@ conflict, 8 no supported live agent ancestor.
 
 The distribution contains the static Rust executable, a native dynamically linked
 GTK3 approval agent, service/policy assets, and a system installer. The GUI needs
-the host GTK3 and polkit libraries; it is not part of the static Rust binary.
+the host GTK3 and polkit libraries, SVG pixbuf loader, MIME database, and icon
+theme; it is not part of the static Rust binary. On Ubuntu these include
+`librsvg2-common`, `shared-mime-info`, and `adwaita-icon-theme`.
 Install the CLI from the release archive, then run
 `agent-keyring-install-system <extracted-package-directory> <absolute-approval-agent-path>`
 through `sudo` or `pkexec`. The approval-agent path can point to the release's
