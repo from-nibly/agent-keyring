@@ -33,8 +33,12 @@ raw copies may remain accessible through other Secret Service clients.
 2. Its child runs `agent-keyring get application.label`.
 3. The daemon authenticates the sender using kernel message credentials and a
    kernel-supplied pidfd, then verifies its live ancestry to an agent process.
-4. One desktop window contains Deny, Once/For this agent run choices, and the
-   administrator identity/password controls. No separate Zenity dialog is used.
+4. One desktop window contains Cancel, Once/For this agent run choices, and the
+   administrator identity/password controls. The secret name appears first in
+   bold, with each request detail on its own line. GTK supplies the configured
+   desktop theme and fonts, including Home Manager themes. No separate Zenity
+   dialog is used. The window advertises itself as a dialog; tiling WMs can enforce
+   floating placement with a rule for WM_CLASS `AgentKeyringApproval`.
 5. Either Allow choice requires **polkit administrator authentication**. Changing
    duration before password submission clears the entry and starts a fresh check
    in the same window. Submitting credentials freezes the scope for that check.

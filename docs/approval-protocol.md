@@ -76,9 +76,14 @@ revocation epoch, process liveness and owner checks.
 
 ## Native listener
 
-Use a single GTK toplevel. Initially Once is selected; password entry waits for
-the first challenge. Show the authoritative message and offered administrator
-identities inline. Every BeginAuthentication must match the read action, the
+Use a single GTK toplevel with a dialog type hint and stable WM_CLASS
+`AgentKeyringApproval`; tiling-desktop configuration should float that class.
+Initially Once is selected; password entry waits for the first challenge. Put the
+secret name first and emphasize it using theme-relative typography. Show agent,
+process ID, start ticks, version, and access scope on separate labeled lines, with
+o privilege-reassurance sentence. Show the offered administrator identities inline.
+After exact challenge validation, render the selected base message, not the
+internal request nonce suffix. This is display formatting only: Every BeginAuthentication must match the read action, the
 expected exact message above for the latest emitted choice, and the CLI subject
 PID in `polkit.subject-pid`. Reject stale/foreign/duplicate challenges.
 
@@ -113,6 +118,10 @@ an existing user-manager SERVICE, not scope, using a trusted `/usr/bin/systemd-r
   KillMode=control-group, SendSIGKILL=yes
 - working directory `/`, trusted `/usr/bin/env -i` and a strict environment allowlist
   derived from the already verified desktop account/session
+- preserve the account HOME for normal GTK settings; the user GUI's XDG_DATA_DIRS
+  includes `HOME/.nix-profile/share`, `/usr/local/share`, and `/usr/share` so
+  Home Manager themes/icons resolve. Do not force GTK_THEME or custom colors,
+  inherit arbitrary loader variables, or send these data paths to root checks
 - remove loader-injection variables at the unit boundary as defense in depth;
   user manager and same-UID desktop still remain trusted
 

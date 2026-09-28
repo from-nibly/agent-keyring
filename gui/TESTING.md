@@ -23,6 +23,13 @@ Nix uses the same strict C build and runs the same tests during `checkPhase`:
 nix-build nix/approval-agent.nix --no-out-link
 ```
 
+To build and run the native fake-session tests in the same Nix development
+environment without running the package's install phase:
+
+```nu
+nix-shell nix/approval-agent.nix --run 'make -C gui all check'
+```
+
 The package installs `libexec/agent-keyring-approval`, with GTK runtime wrapping.
 It links `nix/host-polkit.nix`, whose helper path defaults to
 `/usr/lib/polkit-1/polkit-agent-helper-1`, not `/run/wrappers/bin`.
@@ -34,9 +41,15 @@ SessionOps use a fake GObject with polkit-compatible signals. It never registers
 an agent, runs pkcheck, starts a PAM helper, or asks for a real password.
 
 Checks exercise argv and exact message/PID/action matching; duplicate/reused
-cookies; Once → Run → Once generation changes; one GTK toplevel; late old
-requests/completions; synchronous cancel/completed reentrancy; queued and
-cross-thread cancellation; retained identities; identity switching; Enter and
+cookies; Once → Run → Once generation changes; one GTK toplevel with the X11
+`AgentKeyringApproval` WM_CLASS, dialog hint, modal and nonresizable flags;
+a horizontal Cancel/Authenticate action row; plain-text multiline metadata with
+a bold, relatively scaled secret heading; literal markup-like/non-ASCII text;
+long unbroken secret names wrapping within the allocated label; and display of
+the selected base message without the verified challenge's request nonce.
+They also cover late old requests/completions; synchronous cancel/completed
+reentrancy; queued and cross-thread cancellation; retained identities; identity
+switching; Enter and
 button submission; freeze-before-response; multiple hidden/visible PAM prompts;
 password clearing; the 16-choice cap; liveness EOF/unexpected data; deadlines;
 and credential/cookie exclusion from control streams. A fork-only hardening
@@ -46,6 +59,12 @@ redirection without executing any authentication code.
 Control records are sent before retiring an old authentication session: CHOICE
 invalidates the old root check before cancellation can finish it, and CANCEL
 notifies root before synchronous cleanup can delay window shutdown.
+
+The layout uses the installed GTK theme's font family and colors, without CSS,
+absolute font sizes, or a forced theme. Dialog hints are advisory; tiling window
+managers may additionally need a floating rule matching `AgentKeyringApproval`.
+The base message is only a presentation choice: action, full challenge text
+(including request ID and generation), and subject-PID validation remain exact.
 
 ## Lifetime and deployment boundaries
 

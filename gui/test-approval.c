@@ -86,8 +86,8 @@ typedef struct {
 static const Options test_options = {
     .pid = 1234, .start_time = 6789, .uid = 1000, .timeout = 60,
     .request_id = "0123456789abcdef0123456789abcdef",
-    .once_message = "Read key demo, version 1, agent PID 42/start 77; once",
-    .run_message = "Read key demo, version 1, agent PID 42/start 77; run"
+    .once_message = "Secret: github.api_token\nAgent: pi\nProcess ID: 1234\nStarted (ticks): 6789\nSecret version: 1\nAccess: this one request",
+    .run_message = "Secret: github.api_token\nAgent: pi\nProcess ID: 1234\nStarted (ticks): 6789\nSecret version: 1\nAccess: agent process and live descendants until exit"
 };
 
 static void drain(void) { while (g_main_context_iteration(NULL, FALSE)) {} }
@@ -100,14 +100,14 @@ static guint windows(void)
     g_list_free(list);
     return n;
 }
-static void fixture_init(Fixture *f)
+static void fixture_init_options(Fixture *f, const Options *options)
 {
     memset(f, 0, sizeof *f);
     creates = cancels = responses = 0;
     respond_next_prompt = initiate_complete = FALSE;
     cancel_probe_fd = -1;
     g_assert_cmpint(pipe2(f->pipefd, O_CLOEXEC | O_NONBLOCK), ==, 0);
-    app_init(&f->app, &test_options, &fake_ops, f->pipefd[1]);
+    app_init(&f->app, options, &fake_ops, f->pipefd[1]);
     responding_app = &f->app;
     f->listener = g_object_new(approval_listener_get_type(), NULL);
     f->listener->app = &f->app;
@@ -116,6 +116,8 @@ static void fixture_init(Fixture *f)
     g_assert_true(emit_choice(&f->app));
     g_assert_cmpuint(windows(), ==, 1);
 }
+static void fixture_init(Fixture *f) { fixture_init_options(f, &test_options); }
+
 static void fixture_clear(Fixture *f)
 {
     app_clear(&f->app);
@@ -167,6 +169,104 @@ static gchar *records(Fixture *f)
     return g_strdup(buffer);
 }
 
+static void assert_display(App *app, const gchar *message)
+{
+    gchar **lines = g_strsplit(message, "\n", -1);
+    GList *children = gtk_container_get_children(GTK_CONTAINER(app->message));
+    g_assert_cmpuint(g_list_length(children), ==, g_strv_length(lines));
+    guint i = 0;
+    for (GList *it = children; it != NULL; it = it->next, ++i) {
+        GtkLabel *label = GTK_LABEL(it->data);
+        g_assert_false(gtk_label_get_use_markup(label));
+        g_assert_cmpstr(gtk_label_get_text(label), ==, lines[i]);
+        g_assert_true(gtk_label_get_line_wrap(label));
+        g_assert_cmpint(gtk_label_get_line_wrap_mode(label), ==, PANGO_WRAP_WORD_CHAR);
+        g_assert_cmpint(gtk_label_get_ellipsize(label), ==, PANGO_ELLIPSIZE_NONE);
+        if (i == 0) {
+            PangoAttrList *attrs = gtk_label_get_attributes(label);
+            g_assert_nonnull(attrs);
+            PangoAttrIterator *iter = pango_attr_list_get_iterator(attrs);
+            PangoAttribute *weight = pango_attr_iterator_get(iter, PANGO_ATTR_WEIGHT);
+            PangoAttribute *scale = pango_attr_iterator_get(iter, PANGO_ATTR_SCALE);
+            g_assert_nonnull(weight);
+            g_assert_nonnull(scale);
+            g_assert_cmpint(((PangoAttrInt *)weight)->value, ==, PANGO_WEIGHT_BOLD);
+            g_assert_cmpfloat(((PangoAttrFloat *)scale)->value, >, 1.0);
+            GSList *all = pango_attr_iterator_get_attrs(iter);
+            g_assert_cmpuint(g_slist_length(all), ==, 2);
+            g_slist_free_full(all, (GDestroyNotify)pango_attribute_destroy);
+            pango_attr_iterator_destroy(iter);
+        }
+    }
+    g_list_free(children);
+    g_strfreev(lines);
+}
+
+static void test_dialog_layout(void)
+{
+    Fixture f; fixture_init(&f);
+    drain();
+    GtkWindow *window = GTK_WINDOW(f.app.window);
+    g_assert_cmpint(gtk_window_get_type_hint(window), ==, GDK_WINDOW_TYPE_HINT_DIALOG);
+    g_assert_cmpint(gdk_window_get_type_hint(gtk_widget_get_window(f.app.window)), ==,
+                    GDK_WINDOW_TYPE_HINT_DIALOG);
+    g_assert_false(gtk_window_get_resizable(window));
+    g_assert_true(gtk_window_get_modal(window));
+    g_assert_cmpstr(gdk_get_program_class(), ==, "AgentKeyringApproval");
+    guchar *wm_class = NULL;
+    gint length = 0;
+    g_assert_true(gdk_property_get(gtk_widget_get_window(f.app.window),
+        gdk_atom_intern_static_string("WM_CLASS"), gdk_atom_intern_static_string("STRING"),
+        0, 1024, FALSE, NULL, NULL, &length, &wm_class));
+    g_assert_cmpint(length, >, 0);
+    gsize class_offset = strlen((const gchar *)wm_class) + 1;
+    g_assert_cmpuint(class_offset, <, (gsize)length);
+    g_assert_cmpstr((const gchar *)wm_class + class_offset, ==, "AgentKeyringApproval");
+    g_free(wm_class);
+    GtkWidget *actions = gtk_widget_get_parent(f.app.submit);
+    g_assert_true(GTK_IS_BUTTON_BOX(actions));
+    g_assert_cmpint(gtk_orientable_get_orientation(GTK_ORIENTABLE(actions)), ==,
+                    GTK_ORIENTATION_HORIZONTAL);
+    GList *buttons = gtk_container_get_children(GTK_CONTAINER(actions));
+    g_assert_cmpuint(g_list_length(buttons), ==, 2);
+    g_assert_cmpstr(gtk_button_get_label(GTK_BUTTON(buttons->data)), ==, "Cancel");
+    g_assert_true(buttons->next->data == f.app.submit);
+    g_assert_cmpstr(gtk_button_get_label(GTK_BUTTON(f.app.submit)), ==, "Authenticate");
+    assert_display(&f.app, test_options.once_message);
+    g_signal_emit_by_name(buttons->data, "clicked");
+    g_assert_true(f.app.stopped);
+    g_list_free(buttons);
+    fixture_clear(&f);
+}
+
+static void test_long_literal_message(void)
+{
+    gchar *key = g_strnfill(240, 'x');
+    gchar *message = g_strdup_printf("Secret: <b>clé&%s</b>\nAgent: <i>pi</i>\nProcess ID: 1234\nStarted (ticks): 6789\nSecret version: 1\nAccess: this one request", key);
+    Options options = test_options;
+    options.once_message = message;
+    Fixture f; fixture_init_options(&f, &options);
+    drain();
+    assert_display(&f.app, message);
+    GList *children = gtk_container_get_children(GTK_CONTAINER(f.app.message));
+    GtkWidget *heading = children->data;
+    PangoLayout *layout = gtk_label_get_layout(GTK_LABEL(heading));
+    g_assert_cmpint(pango_layout_get_line_count(layout), >, 1);
+    gint width, height;
+    pango_layout_get_pixel_size(layout, &width, &height);
+    g_assert_cmpint(width, <=, gtk_widget_get_allocated_width(heading));
+    g_assert_cmpint(height, <=, gtk_widget_get_allocated_height(heading));
+    g_assert_cmpint(gtk_widget_get_allocated_width(f.app.window), <, 1024);
+    g_assert_cmpint(gtk_widget_get_allocated_height(f.app.window), <, 768);
+    g_list_free(children);
+    GCancellable *cancel = offer_current(&f, "literal-message");
+    g_assert_nonnull(f.app.active);
+    assert_display(&f.app, message);
+    fixture_clear(&f);
+    g_object_unref(cancel);
+    g_free(message); g_free(key);
+}
+
 static void test_options_parser(void)
 {
     char *argv[] = {"approval", "--pid", "1234", "--start-time", "6789",
@@ -198,23 +298,34 @@ static void test_correlation(void)
 {
     Fixture f; fixture_init(&f);
     gchar *message = expected_message(&f.app);
-    g_assert_cmpstr(message, ==, "Read key demo, version 1, agent PID 42/start 77; once\n\nRequest: 0123456789abcdef0123456789abcdef/1");
+    gchar *full_message = g_strconcat(test_options.once_message,
+        "\n\nRequest: 0123456789abcdef0123456789abcdef/1", NULL);
+    g_assert_cmpstr(message, ==, full_message);
+    g_free(full_message);
+    assert_display(&f.app, test_options.once_message);
     GCancellable *cancel = g_cancellable_new();
     offer(&f, cancel, "foreign.action", message, "1234", "a");
     offer(&f, cancel, READ_ACTION, "wrong message", "1234", "b");
     offer(&f, cancel, READ_ACTION, message, "01234", "c");
     offer(&f, cancel, READ_ACTION, message, NULL, "d");
+    offer(&f, cancel, READ_ACTION, test_options.once_message, "1234", "no-nonce");
+    gchar *wrong_request = g_strconcat(test_options.once_message,
+        "\n\nRequest: fedcba9876543210fedcba9876543210/1", NULL);
+    offer(&f, cancel, READ_ACTION, wrong_request, "1234", "wrong-request");
+    g_free(wrong_request);
     g_assert_null(f.app.active);
     g_assert_cmpuint(creates, ==, 0);
     offer(&f, cancel, READ_ACTION, message, "1234", "accepted");
     Challenge *first = f.app.active;
     g_assert_nonnull(first);
+    assert_display(&f.app, test_options.once_message);
     offer(&f, cancel, READ_ACTION, message, "1234", "duplicate");
     g_assert_true(f.app.active == first);
     g_assert_cmpuint(creates, ==, 1);
     drain();
-    g_assert_cmpuint(f.cancelled, ==, 5);
+    g_assert_cmpuint(f.cancelled, ==, 7);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(f.app.run), TRUE);
+    assert_display(&f.app, test_options.run_message);
     offer(&f, cancel, READ_ACTION, message, "1234", "stale");
     g_free(message);
     message = expected_message(&f.app);
@@ -222,11 +333,12 @@ static void test_correlation(void)
     g_assert_null(f.app.active);
     offer(&f, cancel, READ_ACTION, message, "1234", "new-cookie");
     g_assert_nonnull(f.app.active);
+    assert_display(&f.app, test_options.run_message);
     g_assert_cmpuint(windows(), ==, 1);
     g_free(message);
     fixture_clear(&f);
     g_object_unref(cancel);
-    g_assert_cmpuint(f.finished, ==, 9);
+    g_assert_cmpuint(f.finished, ==, 11);
 }
 
 static void test_rejected_identity_and_precancel(void)
@@ -300,6 +412,7 @@ static void test_generations_stale_callbacks(void)
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(f.app.once), TRUE);
     GCancellable *third = offer_current(&f, "generation-three");
     g_assert_cmpuint(f.app.active->sequence, ==, 3);
+    assert_display(&f.app, test_options.once_message);
     gchar *output = records(&f);
     g_assert_cmpstr(output, ==, "READY\nCHOICE 1 once\nCHOICE 2 run\nCHOICE 3 once\n");
     g_free(output);
@@ -337,6 +450,7 @@ static void test_identity_enter_multiple_prompts(void)
     g_assert_cmpuint(creates, ==, 2); /* frozen, even on a programmatic signal */
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(f.app.run), TRUE);
     g_assert_cmpuint(f.app.sequence, ==, 1);
+    assert_display(&f.app, test_options.once_message);
     respond_next_prompt = FALSE;
     gtk_entry_set_text(GTK_ENTRY(f.app.entry), "credential-canary");
     g_signal_emit_by_name(f.app.submit, "clicked");
@@ -515,7 +629,11 @@ static void test_hardening_streams(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_set_prgname("AgentKeyringApproval");
+    gdk_set_program_class("AgentKeyringApproval");
     gtk_init(&argc, &argv);
+    g_test_add_func("/approval/dialog-layout", test_dialog_layout);
+    g_test_add_func("/approval/long-literal-message", test_long_literal_message);
     g_test_add_func("/approval/options-parser", test_options_parser);
     g_test_add_func("/approval/correlation", test_correlation);
     g_test_add_func("/approval/rejected-identity-precancel", test_rejected_identity_and_precancel);

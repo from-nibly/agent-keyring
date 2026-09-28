@@ -2,7 +2,7 @@
 
 ## Automated
 
-The implementation passes 87 Rust tests on both GNU and musl, 13 native GTK
+The implementation passes 89 Rust tests on both GNU and musl, 15 native GTK
 fake-session tests under Xvfb, Clippy with warnings denied on GNU, Rustfmt,
 ShellCheck, and actionlint. The v0.1.0 tag's
 static build exposed libc-specific ancillary length types; v0.1.1 fixes those
@@ -62,6 +62,29 @@ writable executable files or initial parent-directory traversal.
 Wrong-password account-lockout behavior and every possible host PAM conversation
 were not manually exercised. Native tests simulate failure, multiple prompts,
 identity changes, cancellation, and stale callbacks without real credentials.
+
+## Layout and desktop-theme verification
+
+The revised dialog puts the secret first in bold, theme-relative typography and
+separates agent, process ID, start ticks, version, and access scope into labeled
+rows. It omits the privilege-reassurance sentence and internal correlation nonce
+from the presentation, while retaining exact challenge validation.
+
+- Fifteen native tests include actual X11 WM_CLASS/type-hint assertions, modal
+  and nonresizable flags, literal-text rendering, long-key wrapping, and nonce
+  validation without nonce display.
+- A credential-disabled native preview on the live desktop was reported by BSPWM
+  as `AgentKeyringApproval`, state `floating`. The explicit matching BSPWM rule is
+  configured in Home Manager and applied to the current desktop.
+- A GTK rendering probe using the real user settings confirmed the theme lookup
+  fix: without the Home Manager data path the named Gruvbox theme silently fell
+  back to an Adwaita background (`#f6f5f4`); with that path it rendered the expected
+  Gruvbox background (`#282828`). No theme, font family, or colors are forced.
+
+After an administrator-authorized reload, the revised production frontend and
+broker also passed a real password-backed Once read of `acceptance.layout`.
+The follow-up noninteractive read returned exit 4, no grants or approval user
+units remained, and the daemon retained NoNewPrivileges=yes with zero restarts.
 
 ## Initial desktop acceptance (two-dialog implementation)
 

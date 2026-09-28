@@ -861,6 +861,17 @@ fn account(uid: u32) -> Result<Account> {
     })
 }
 
+fn desktop_data_dirs(home: &Path) -> Result<OsString> {
+    // The user GUI may load themes/icons from Home Manager. Do not pass this
+    // search path to root polkit checks or inherit arbitrary loader variables.
+    std::env::join_paths([
+        home.join(".nix-profile/share"),
+        PathBuf::from("/usr/local/share"),
+        PathBuf::from("/usr/share"),
+    ])
+    .context("invalid desktop data path")
+}
+
 fn desktop_environment(
     subject: &Subject,
     session: &Session,
@@ -925,6 +936,7 @@ fn desktop_environment(
     );
     let mut env = vec![
         ("HOME".into(), account.home.as_os_str().to_owned()),
+        ("XDG_DATA_DIRS".into(), desktop_data_dirs(&account.home)?),
         ("USER".into(), account.name.clone()),
         ("LOGNAME".into(), account.name.clone()),
         ("DISPLAY".into(), display.into()),
@@ -2116,6 +2128,36 @@ mod tests {
         assert!(account.home.is_absolute());
         assert!(!account.name.is_empty());
         assert_ne!(account.gid, u32::MAX);
+    }
+
+    #[test]
+    fn desktop_theme_paths_include_home_manager_without_forcing_a_theme() {
+        let dirs = desktop_data_dirs(Path::new("/home/theme user")).unwrap();
+        assert_eq!(
+            std::env::split_paths(&dirs).collect::<Vec<_>>(),
+            [
+                PathBuf::from("/home/theme user/.nix-profile/share"),
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        );
+        assert!(desktop_data_dirs(Path::new("/home/invalid:path")).is_err());
+        let command = check_command(
+            Path::new("/usr/bin/pkcheck"),
+            &Subject {
+                pid: 42,
+                uid: 1000,
+                start_time: 77,
+            },
+            READ_ACTION,
+            "synthetic message",
+        )
+        .unwrap();
+        assert!(
+            !command
+                .get_envs()
+                .any(|(name, _)| name == "XDG_DATA_DIRS" || name == "GTK_THEME")
+        );
     }
 
     #[test]

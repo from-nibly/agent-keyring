@@ -18,6 +18,13 @@ pub struct Config {
     pub auth: auth::Config,
 }
 
+fn read_approval_message(agent: &Agent, key: &str, version: u64, scope: &str) -> String {
+    format!(
+        "Secret: {key}\nAgent: {}\nProcess ID: {}\nStarted (ticks): {}\nSecret version: {version}\nAccess: {scope}",
+        agent.name, agent.pid, agent.start_time
+    )
+}
+
 struct Root {
     owner: u32,
     process: PinnedProcess,
@@ -333,12 +340,7 @@ impl Broker {
                 "another approval is pending or cleanup is unconfirmed for this user",
             );
         };
-        let message = |scope| {
-            format!(
-                "Allow {} (PID {}, started {}) to read secret {} version {} for {}? The agent will receive the secret, not root privileges.",
-                root.1.name, root.1.pid, root.1.start_time, key, metadata.version, scope
-            )
-        };
+        let message = |scope| read_approval_message(&root.1, key, metadata.version, scope);
         let choice = match auth::approve_read(
             &self.auth,
             subject,
@@ -685,6 +687,34 @@ fn lock_state(directory: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_prompt_puts_the_secret_first_and_each_detail_on_its_own_line() {
+        let agent = Agent {
+            name: "pi".into(),
+            pid: 42,
+            start_time: 77,
+            executable: "/test/pi".into(),
+        };
+        for scope in [
+            "this one request",
+            "this agent process and its live descendants until it exits",
+        ] {
+            let message = read_approval_message(&agent, "github.api_token", 3, scope);
+            assert_eq!(
+                message.lines().collect::<Vec<_>>(),
+                [
+                    "Secret: github.api_token",
+                    "Agent: pi",
+                    "Process ID: 42",
+                    "Started (ticks): 77",
+                    "Secret version: 3",
+                    &format!("Access: {scope}"),
+                ]
+            );
+            assert!(!message.contains("root privileges"));
+        }
+    }
     fn fixture() -> (tempfile::TempDir, Broker, Peer) {
         use std::os::fd::{FromRawFd, OwnedFd};
         let directory = tempfile::tempdir().unwrap();

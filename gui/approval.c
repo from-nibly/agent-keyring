@@ -80,6 +80,7 @@ G_DEFINE_TYPE(ApprovalListener, approval_listener, POLKIT_AGENT_TYPE_LISTENER)
 static void app_stop(App *app);
 static void challenge_finish(Challenge *c, gboolean cancelled);
 static void start_identity(Challenge *c, guint index);
+static void display_message(App *app);
 
 static gboolean parse_uint(const gchar *text, guint64 max, guint64 *out)
 {
@@ -377,7 +378,7 @@ static void scope_changed(GtkToggleButton *button, gpointer data)
     gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(app->identities));
     app->changing_identity = FALSE;
     gtk_widget_set_sensitive(app->identities, FALSE);
-    gtk_label_set_text(GTK_LABEL(app->message), run ? app->options.run_message : app->options.once_message);
+    display_message(app);
     gtk_label_set_text(GTK_LABEL(app->prompt), "");
     gtk_label_set_text(GTK_LABEL(app->status), "Waiting for administrator authentication…");
     if (app->sequence == MAX_CHOICES) {
@@ -436,7 +437,8 @@ static void begin_authentication(PolkitAgentListener *listener, const gchar *act
     app->accepted_sequence = app->sequence;
     g_hash_table_add(app->cookies, g_strdup(cookie));
     c->cancel_handler = g_cancellable_connect(cancellable, G_CALLBACK(cancelled_cb), c, NULL);
-    gtk_label_set_text(GTK_LABEL(app->message), message);
+    /* The full nonce-bearing message was verified above. Keep displaying only
+     * the selected immutable base message, not protocol correlation metadata. */
     gtk_label_set_text(GTK_LABEL(app->status), "Authenticate as an offered administrator.");
     app->changing_identity = TRUE;
     gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(app->identities));
@@ -512,9 +514,36 @@ static GtkWidget *text_label(const gchar *text)
 {
     GtkWidget *label = gtk_label_new(text);
     gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
     gtk_label_set_xalign(GTK_LABEL(label), 0);
-    gtk_label_set_max_width_chars(GTK_LABEL(label), 72);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 60);
     return label;
+}
+
+static void display_message(App *app)
+{
+    GList *children = gtk_container_get_children(GTK_CONTAINER(app->message));
+    for (GList *it = children; it != NULL; it = it->next)
+        gtk_widget_destroy(GTK_WIDGET(it->data));
+    g_list_free(children);
+    const gchar *message = app->run_scope ? app->options.run_message : app->options.once_message;
+    gchar **lines = g_strsplit(message, "\n", -1);
+    for (guint i = 0; lines[i] != NULL; ++i) {
+        GtkWidget *label = text_label(lines[i]);
+        if (i == 0) {
+            /* Plain text plus relative attributes: never parse secret names as
+             * markup or override the installed theme's font family or colors. */
+            PangoAttrList *attrs = pango_attr_list_new();
+            pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+            pango_attr_list_insert(attrs, pango_attr_scale_new(PANGO_SCALE_LARGE));
+            gtk_label_set_attributes(GTK_LABEL(label), attrs);
+            pango_attr_list_unref(attrs);
+            gtk_widget_set_margin_bottom(label, 6);
+        }
+        gtk_box_pack_start(GTK_BOX(app->message), label, FALSE, FALSE, 0);
+    }
+    g_strfreev(lines);
+    gtk_widget_show_all(app->message);
 }
 
 static void app_init(App *app, const Options *options, const SessionOps *ops, gint output_fd)
@@ -530,10 +559,14 @@ static void app_init(App *app, const Options *options, const SessionOps *ops, gi
     app->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app->window), "Agent Keyring — Administrator Approval");
     gtk_window_set_default_size(GTK_WINDOW(app->window), 580, -1);
+    gtk_window_set_type_hint(GTK_WINDOW(app->window), GDK_WINDOW_TYPE_HINT_DIALOG);
+    gtk_window_set_resizable(GTK_WINDOW(app->window), FALSE);
+    gtk_window_set_modal(GTK_WINDOW(app->window), TRUE);
     gtk_container_set_border_width(GTK_CONTAINER(app->window), 20);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_container_add(GTK_CONTAINER(app->window), box);
-    app->message = text_label(options->once_message);
+    app->message = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    display_message(app);
     app->once = gtk_radio_button_new_with_label(NULL, "Allow once");
     app->run = gtk_radio_button_new_with_label_from_widget(GTK_RADIO_BUTTON(app->once), "Allow for this agent run");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->once), TRUE);
@@ -546,8 +579,13 @@ static void app_init(App *app, const Options *options, const SessionOps *ops, gi
     app->status = text_label("Waiting for administrator authentication…");
     app->submit = gtk_button_new_with_label("Authenticate");
     GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    GtkWidget *actions = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_button_box_set_layout(GTK_BUTTON_BOX(actions), GTK_BUTTONBOX_END);
+    gtk_box_set_spacing(GTK_BOX(actions), 8);
+    gtk_box_pack_start(GTK_BOX(actions), cancel, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(actions), app->submit, FALSE, FALSE, 0);
     GtkWidget *widgets[] = {app->message, app->once, app->run,
-        app->identities, app->prompt, app->entry, app->status, app->submit, cancel};
+        app->identities, app->prompt, app->entry, app->status, actions};
     for (guint i = 0; i < G_N_ELEMENTS(widgets); ++i)
         gtk_box_pack_start(GTK_BOX(box), widgets[i], FALSE, FALSE, 0);
     clear_entry(app);
@@ -677,6 +715,9 @@ int main(int argc, char **argv)
     gint output_fd = harden_process();
     Options options;
     if (output_fd < 0) return 1;
+    /* GTK derives the X11 class from the program name again during init. */
+    g_set_prgname("AgentKeyringApproval");
+    gdk_set_program_class("AgentKeyringApproval");
     if (!parse_options(argc, argv, &options) || getuid() == 0 ||
         getuid() != options.uid || geteuid() != options.uid ||
         prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0 || !subject_alive(&options) ||
