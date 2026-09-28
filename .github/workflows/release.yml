@@ -23,13 +23,15 @@ jobs:
           rustup default 1.95.0
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get update
-          sudo apt-get install -y musl-tools shellcheck
+          sudo apt-get install -y musl-tools shellcheck build-essential pkg-config libgtk-3-dev libpolkit-agent-1-dev xvfb xauth
       - name: Check source and unit tests
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
           shellcheck scripts/*.sh
+      - name: Build and test native approval window
+        run: make -C gui all check
       - name: Test musl target
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
@@ -48,9 +50,14 @@ jobs:
             exit 1
           fi
           package="agent-keyring-v${version}-x86_64-unknown-linux-musl"
-          mkdir -p "dist/$package/bin" "dist/$package/share"
+          mkdir -p "dist/$package/"{bin,libexec,share,gui,nix,docs}
           install -m755 target/x86_64-unknown-linux-musl/release/agent-keyring "dist/$package/bin/agent-keyring"
           install -m755 scripts/install-system.sh "dist/$package/bin/agent-keyring-install-system"
+          install -m755 gui/agent-keyring-approval "dist/$package/libexec/agent-keyring-approval"
+          cp gui/approval.c gui/test-approval.c gui/Makefile gui/TESTING.md "dist/$package/gui/"
+          cp nix/approval-agent.nix nix/host-polkit.nix nix/polkit-agent.nix "dist/$package/nix/"
+          cp docs/approval-protocol.md docs/verification.md "dist/$package/docs/"
+          cp Cargo.toml "dist/$package/"
           cp -R share/agent-keyring "dist/$package/share/agent-keyring"
           cp README.md LICENSE "dist/$package/"
           epoch=$(git log -1 --format=%ct)

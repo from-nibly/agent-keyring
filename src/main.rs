@@ -51,8 +51,8 @@ enum Command {
     Daemon {
         #[arg(long, default_value = "/var/lib/agent-keyring")]
         state_dir: PathBuf,
-        #[arg(long, default_value = "/usr/bin/zenity")]
-        zenity: PathBuf,
+        #[arg(long, default_value = "/usr/local/libexec/agent-keyring-approval")]
+        approval_agent: PathBuf,
         #[arg(long, default_value = "/usr/bin/pkcheck")]
         pkcheck: PathBuf,
         #[arg(long, default_value = "/usr/bin/loginctl")]
@@ -73,7 +73,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     if let Command::Daemon {
         state_dir,
-        zenity,
+        approval_agent,
         pkcheck,
         loginctl,
     } = &cli.command
@@ -82,7 +82,7 @@ fn run(cli: Cli) -> Result<u8> {
             socket: cli.socket,
             state_dir: state_dir.clone(),
             auth: agent_keyring::auth::Config {
-                zenity: zenity.clone(),
+                approval_agent: approval_agent.clone(),
                 pkcheck: pkcheck.clone(),
                 loginctl: loginctl.clone(),
                 timeout: std::time::Duration::from_secs(60),

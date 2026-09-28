@@ -13,6 +13,8 @@ case "$1" in
     [[ ! -e "$work" ]] || { echo 'Acceptance directory already exists; stop it explicitly first.' >&2; exit 1; }
     binary=$(realpath -- "$source_dir/result-acceptance/bin/agent-keyring")
     [[ "$binary" == /nix/store/* && -x "$binary" ]] || { echo 'Build the immutable acceptance binary first.' >&2; exit 1; }
+    approval_agent=$(realpath -- "$source_dir/result-approval/libexec/agent-keyring-approval")
+    [[ "$approval_agent" == /nix/store/* && -x "$approval_agent" ]] || { echo 'Build the immutable approval-agent package first.' >&2; exit 1; }
     install -d -m0755 "$work"
     install -m0644 "$source_dir/share/agent-keyring/io.github.from-nibly.agent-keyring.policy" "$work/policy"
     if [[ -e "$policy" ]]; then
@@ -28,7 +30,7 @@ case "$1" in
       --property=ProtectHome=read-only --property="ReadWritePaths=$work" \
       --property=RestrictAddressFamilies=AF_UNIX \
       "$binary" --socket "$work/control.sock" daemon \
-        --state-dir "$work/state" --zenity /usr/bin/zenity
+        --state-dir "$work/state" --approval-agent "$approval_agent"
     ;;
   stop)
     [[ -f "$work/acceptance-marker" && ! -L "$work" ]] || { echo 'Missing acceptance marker; refusing cleanup.' >&2; exit 1; }

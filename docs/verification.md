@@ -2,8 +2,9 @@
 
 ## Automated
 
-The implementation passes 70 Rust tests on both GNU and musl, Clippy with
-warnings denied on GNU, Rustfmt, ShellCheck, and actionlint. The v0.1.0 tag's
+The implementation passes 87 Rust tests on both GNU and musl, 13 native GTK
+fake-session tests under Xvfb, Clippy with warnings denied on GNU, Rustfmt,
+ShellCheck, and actionlint. The v0.1.0 tag's
 static build exposed libc-specific ancillary length types; v0.1.1 fixes those
 conversions and adds musl tests as a release gate. Local musl testing used Rust
 1.98.1; CI pins Rust 1.95.0 for both targets.
@@ -31,7 +32,38 @@ Coverage includes:
 The `pkcheck` parser regression matters: polkit 124's help advertises `--details`,
 while the executable accepts `--detail` or `-d`. Production uses `-d`.
 
-## Actual desktop acceptance
+## Single-window desktop acceptance (v0.2.0)
+
+The static musl daemon and Nix-built GTK3/PolkitAgent frontend were exercised with
+synthetic data on the same host described below. Verified:
+
+- An unprivileged Xvfb probe registered the actual process-scoped listener with
+  the real polkit authority, observed exactly one visible GTK toplevel, and
+  confirmed liveness-EOF shutdown and inactive transient-service state. It made
+  no authentication request.
+- Actual administrator authentication in the combined window released a Once
+  response; a subsequent noninteractive request was denied with exit 4.
+- Changing the selection from Once to Run in that window cancelled the old
+  check and completed a fresh scope-bound authentication. The next temporary
+  child request succeeded without a prompt, and the grant identified the real
+  Pi PID/start-time instance.
+- Explicit revoke invalidated the grant; subsequent noninteractive read denied.
+- Cancel returned exit 4, left no grants, and left no approval user service.
+- The root daemon retained NoNewPrivileges=yes and did not restart. Polkit logs
+  identified the process-scoped agent and ONE-SHOT authorizations. The cancelled
+  superseded scope check is logged as failed authentication, as expected.
+
+Review corrected CHOICE/CANCEL-before-session-cleanup ordering. Tests cover that
+ordering, stale callbacks/results, scope freezing before credential responses,
+private liveness/control descriptors, and credential-canary exclusion from those
+streams. Nix's root-owned sticky store ancestor is accepted without permitting
+writable executable files or initial parent-directory traversal.
+
+Wrong-password account-lockout behavior and every possible host PAM conversation
+were not manually exercised. Native tests simulate failure, multiple prompts,
+identity changes, cancellation, and stale callbacks without real credentials.
+
+## Initial desktop acceptance (two-dialog implementation)
 
 A root-owned transient system service and temporary vault were exercised on
 Pop!_OS 24.04, Linux 7.0, X11/logind and polkit 124. A normal-user GNOME polkit

@@ -5,7 +5,7 @@ Requires=polkit.service systemd-logind.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/libexec/agent-keyring daemon --zenity @ZENITY@
+ExecStart=/usr/local/libexec/agent-keyring daemon --approval-agent @APPROVAL_AGENT@
 Restart=on-failure
 RestartSec=3
 RuntimeDirectory=agent-keyring

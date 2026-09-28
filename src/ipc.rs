@@ -18,8 +18,8 @@ use zeroize::Zeroizing;
 const SO_PASSPIDFD: libc::c_int = 76;
 const SCM_PIDFD: libc::c_int = 4;
 const MAX_FRAME: usize = 300 * 1024;
-// A request can include a 60-second choice dialog and a separate 60-second
-// administrator challenge, plus bounded session checks and delivery.
+// Read approval shares one 60-second deadline across GUI/check generations and
+// session validation, followed by bounded service cleanup and response delivery.
 const TIMEOUT_SECONDS: libc::c_int = 180;
 // Aligned storage, with room for credentials, a pidfd, and malicious SCM_RIGHTS.
 // Linux permits at most 253 SCM_RIGHTS descriptors in a message.

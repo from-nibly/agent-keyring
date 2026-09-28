@@ -1,9 +1,9 @@
 # agent-keyring
 
 A Linux Rust CLI and root-owned daemon for administrator-approved access to secrets
-from Pi, Claude Code and Codex process trees. The desktop approval flow has been
-verified with Pi on an X11/logind desktop; Claude/Codex entrypoint matching has
-unit coverage, but their live installations have not yet been tested.
+from Pi, Claude Code and Codex process trees. The single-window approval flow
+has been verified with Pi on an X11/logind desktop. Claude/Codex entrypoint
+matching has unit coverage, but their live installations have not yet been tested.
 
 ## Security boundary
 
@@ -33,10 +33,14 @@ raw copies may remain accessible through other Secret Service clients.
 2. Its child runs `agent-keyring get application.label`.
 3. The daemon authenticates the sender using kernel message credentials and a
    kernel-supplied pidfd, then verifies its live ancestry to an agent process.
-4. A desktop dialog offers Deny, Allow once, or Allow for this agent run.
-5. Either Allow choice requires **polkit administrator authentication**. The
-   root-owned daemon independently checks the exact pending request; GUI output
-   alone cannot create a grant.
+4. One desktop window contains Deny, Once/For this agent run choices, and the
+   administrator identity/password controls. No separate Zenity dialog is used.
+5. Either Allow choice requires **polkit administrator authentication**. Changing
+   duration before password submission clears the entry and starts a fresh check
+   in the same window. Submitting credentials freezes the scope for that check.
+   The root-owned daemon independently checks the exact pending request; GUI
+   output alone cannot create a grant. Passwords go only from the native GUI to
+   the host polkit authentication helper, never through the daemon or CLI.
 
 **Once** releases one response, not one read per child. **For this agent run**
 allows that secret/version for the approved process and its verified live
@@ -52,7 +56,12 @@ A broker restart clears grants. Secret replacement/deletion invalidates old
 version grants. Revocation prevents future authorization, not responses already
 authorized and in flight. No sudo timestamp or polkit `*_keep` cache is reused.
 An additional request while an approval is pending for that user gets a retryable
-error instead of opening another dialog.
+error instead of opening another dialog. If GUI cleanup cannot be confirmed,
+further approvals for that UID remain blocked until the service is restarted.
+
+Cached run grants follow the approved process lifetime; screen lock or logout
+does not itself revoke them if the process survives. Cached reads do not perform
+fresh desktop/session checks. Use `revoke` to end that permission explicitly.
 
 ## Commands
 
@@ -87,26 +96,45 @@ conflict, 8 no supported live agent ancestor.
 ## Requirements and installation
 
 - Linux with `SO_PASSPIDFD`/`SCM_PIDFD` support (Linux 6.5+; absence fails closed).
-- systemd/logind, polkit (`pkcheck` and `pkexec`) and a running desktop polkit
-  authentication agent.
-- Zenity for the grant-choice dialog and an active local desktop session.
+- systemd 254+ with logind and an existing user service manager; polkit (`pkcheck`
+  and its host authentication helper). A normal desktop authentication agent is
+  still useful for installation through `pkexec` and replacement/deletion.
+- The native `agent-keyring-approval` GUI, GTK3/libpolkit-agent, and an active
+  local X11 desktop session for new approvals. New approvals in Wayland-only,
+  remote, or headless sessions fail closed; already-approved run grants follow
+  the lifetime described above.
 - Root installation of the system service and polkit policy. A user service
   alone cannot enforce ownership of the vault or authorization state.
 
-The distribution contains one Rust executable, service/policy assets and a
-system installer. The GUI and polkit are runtime dependencies, not embedded in
-the binary. Install the CLI from the release archive, then run
-`agent-keyring-install-system <extracted-package-directory> /usr/bin/zenity`
-through `sudo` or `pkexec`. This installs a root-owned copy of the daemon, its
-systemd unit, and the three polkit policies. It does not import existing secrets.
+The distribution contains the static Rust executable, a native dynamically linked
+GTK3 approval agent, service/policy assets, and a system installer. The GUI needs
+the host GTK3 and polkit libraries; it is not part of the static Rust binary.
+Install the CLI from the release archive, then run
+`agent-keyring-install-system <extracted-package-directory> <absolute-approval-agent-path>`
+through `sudo` or `pkexec`. The approval-agent path can point to the release's
+`libexec/agent-keyring-approval` or a Nix-built GUI package. This installs root-owned
+copies of both executables, the systemd unit, and the three polkit policies. It
+does not import existing secrets.
 On systems where `pkexec` rejects a Nix-provided login shell, set `SHELL=/bin/bash`
 for that installer invocation.
 
-For standalone Home Manager on Debian/Ubuntu, `nix/polkit-agent.nix` builds the
-ordinary-user authentication agent against the host's existing setuid polkit
-helper rather than NixOS's `/run/wrappers/bin` path. It does not create a new
-setuid helper. A privileged bootstrap is still required for the system daemon;
-Home Manager's user service manager cannot own that security boundary.
+For standalone Home Manager on Debian/Ubuntu, `nix/approval-agent.nix` builds
+the GUI against the host's existing polkit helper rather than NixOS's
+`/run/wrappers/bin` path. `nix/polkit-agent.nix` supplies an optional ordinary
+desktop authentication agent for other operations. Neither installs a new setuid
+helper. Retain Nix-built packages in your profile while the daemon uses them.
+
+The daemon keeps `NoNewPrivileges=true`. It starts the approval GUI as an
+ordinary-user transient service through the existing user manager, outside that
+inherited restriction so the standard host polkit helper can authenticate. The
+GUI registers only for the requesting CLI process, leaving the normal desktop
+agent alone. Missing manager/registration, invalid protocol, or failed cleanup
+fails closed; there is no application fallback to a second dialog. The user
+manager and desktop are trusted, not an isolation boundary. A privileged
+bootstrap remains necessary for the root daemon and vault.
+
+See [the approval protocol](docs/approval-protocol.md) for scope binding,
+credential handling, cancellation, and lifecycle requirements.
 
 Do not grant the daemon installer or secret operations a broad `NOPASSWD` rule.
 Do not run the actual agent as root.

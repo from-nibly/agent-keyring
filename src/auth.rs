@@ -1,15 +1,15 @@
 //! Host-desktop authorization, not a sandbox or an agent-elevation mechanism.
 //!
-//! A Zenity answer is only an untrusted preference. The root daemon MUST call
-//! `authorize` separately for EVERY new Once/Run grant and every overwrite/delete,
-//! with a message binding the key, root process identity, choice and secret version.
+//! GUI output is only an untrusted preference. `approve_read` independently checks
+//! EVERY new Once/Run grant; `authorize` handles overwrites/deletes independently.
+//! Each check binds the key, root process identity, scope and secret version.
 //! It must independently revalidate ancestry/version before committing the operation.
 //! Install the three actions with `auth_admin` (NEVER `*_keep`), and deny inactive
 //! and remote sessions. Root-owned polkit rules must not bypass those defaults:
 //! pkcheck cannot distinguish a rule returning YES from fresh authentication.
 //!
 //! This deliberately trusts root and the host desktop. X11 clients can spoof or
-//! observe dialogs; same-UID processes can tamper with Zenity and its environment.
+//! observe dialogs; same-UID processes can tamper with the GUI and its environment.
 //! Neither GUI output nor this module makes Docker/root-equivalent users safe.
 //! Password entry belongs to the registered polkit agent, never to this daemon.
 //! X11 is supported; Wayland-only/headless sessions fail closed. A local active
@@ -39,7 +39,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -55,7 +55,7 @@ pub struct Subject {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub zenity: PathBuf,
+    pub approval_agent: PathBuf,
     pub pkcheck: PathBuf,
     pub loginctl: PathBuf,
     pub timeout: Duration,
@@ -64,7 +64,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            zenity: "/usr/bin/zenity".into(),
+            approval_agent: "/usr/local/libexec/agent-keyring-approval".into(),
             pkcheck: "/usr/bin/pkcheck".into(),
             loginctl: "/usr/bin/loginctl".into(),
             timeout: Duration::from_secs(60),
@@ -84,73 +84,474 @@ const DELETE_ACTION: &str = "io.github.from-nibly.agent-keyring.delete";
 const PROC_LIMIT: usize = 128 * 1024;
 const OUTPUT_LIMIT: usize = 16 * 1024;
 
-/// Obtain a preference, NOT authorization. Even `Some(Run)` requires a fresh
-/// root-side `authorize` call; never turn this function's stdout into a grant.
-/// Denial/closing returns None. Timeouts, malformed output and unsafe state err.
-pub fn choose_read(
+const MAX_CHOICES: u32 = 16;
+const PROTOCOL_LIMIT: usize = 512;
+const LINE_LIMIT: usize = 32;
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cleanup could not be proved. The broker must retain its per-UID prompt guard
+/// until daemon restart rather than permit a second, potentially overlapping UI.
+#[derive(Debug)]
+pub struct CleanupError;
+impl std::fmt::Display for CleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("approval cleanup could not be confirmed; user prompts fenced")
+    }
+}
+impl std::error::Error for CleanupError {}
+
+#[derive(Debug)]
+struct ApprovalClosed;
+impl std::fmt::Display for ApprovalClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("approval window closed")
+    }
+}
+impl std::error::Error for ApprovalClosed {}
+
+// Called only after cleanup is proved: window closure is denial, whereas a
+// malformed stream or unavailable service remains an operational error.
+fn approval_outcome(result: Result<Option<GrantChoice>>) -> Result<Option<GrantChoice>> {
+    match result {
+        Err(error) if error.is::<ApprovalClosed>() => Ok(None),
+        result => result,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attempt {
+    sequence: u32,
+    scope: GrantChoice,
+}
+
+#[derive(Default)]
+struct ApprovalParser {
+    ready: bool,
+    sequence: u32,
+    total: usize,
+    line: Vec<u8>,
+}
+impl ApprovalParser {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Attempt>> {
+        self.total = self.total.saturating_add(bytes.len());
+        ensure!(
+            self.total <= PROTOCOL_LIMIT,
+            "approval protocol limit exceeded"
+        );
+        let mut choices = Vec::new();
+        for &byte in bytes {
+            if byte == b'\n' {
+                if !self.ready {
+                    ensure!(self.line == b"READY", "invalid approval protocol order");
+                    self.ready = true;
+                } else {
+                    if self.line == b"CANCEL" {
+                        return Err(ApprovalClosed.into());
+                    }
+                    let sequence = self.sequence + 1;
+                    ensure!(sequence <= MAX_CHOICES, "too many approval choices");
+                    let scope = if self.line == format!("CHOICE {sequence} once").as_bytes() {
+                        GrantChoice::Once
+                    } else if self.line == format!("CHOICE {sequence} run").as_bytes() {
+                        GrantChoice::Run
+                    } else {
+                        // Never include untrusted stdout in errors or daemon logs.
+                        bail!("invalid approval protocol record");
+                    };
+                    ensure!(
+                        sequence != 1 || scope == GrantChoice::Once,
+                        "invalid initial approval scope"
+                    );
+                    self.sequence = sequence;
+                    choices.push(Attempt { sequence, scope });
+                }
+                self.line.clear();
+            } else {
+                ensure!(
+                    byte.is_ascii_graphic() || byte == b' ',
+                    "invalid approval protocol byte"
+                );
+                ensure!(
+                    self.line.len() < LINE_LIMIT,
+                    "approval protocol line too long"
+                );
+                self.line.push(byte);
+            }
+        }
+        Ok(choices)
+    }
+}
+
+// This boundary also permits deterministic scheduling tests without any real
+// authentication requests, GUI windows or user-manager state.
+trait ApprovalIo {
+    fn observe_gui(&mut self, parser: &mut ApprovalParser) -> Result<Vec<Attempt>>;
+    fn stop_check(&mut self) -> Result<()>;
+    fn start_check(&mut self, attempt: Attempt) -> Result<()>;
+    fn check_result(&mut self) -> Result<Option<bool>>;
+}
+
+fn apply_choices(
+    io: &mut impl ApprovalIo,
+    current: &mut Option<Attempt>,
+    choices: Vec<Attempt>,
+) -> Result<()> {
+    for attempt in choices {
+        // Invalidate FIRST, including an already-exited successful old child.
+        *current = None;
+        io.stop_check()?;
+        io.start_check(attempt)?;
+        *current = Some(attempt);
+    }
+    Ok(())
+}
+
+fn approval_tick(
+    io: &mut impl ApprovalIo,
+    parser: &mut ApprovalParser,
+    current: &mut Option<Attempt>,
+    now: Instant,
+    deadline: Instant,
+) -> Result<Option<Option<GrantChoice>>> {
+    ensure!(now < deadline, "authentication timed out");
+    let choices = io.observe_gui(parser)?;
+    apply_choices(io, current, choices)?;
+    let Some(attempt) = *current else {
+        return Ok(None);
+    };
+    let Some(success) = io.check_result()? else {
+        return Ok(None);
+    };
+    // Observe cancellation/changes once more AFTER collecting status. A partial
+    // record also blocks commitment, rather than authorizing over its prefix.
+    let choices = io.observe_gui(parser)?;
+    apply_choices(io, current, choices)?;
+    if *current != Some(attempt) || !parser.line.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(success.then_some(attempt.scope)))
+}
+
+/// One GUI, one absolute deadline, and at most one independent root check.
+/// Returns only the immutable scope of the successful current check, never a
+/// preference. Both messages are authored by the broker from pinned metadata.
+pub fn approve_read(
     config: &Config,
     subject: &Subject,
-    key: &str,
-    agent_name: &str,
-    root_pid: i32,
-    root_executable: &str,
+    once_message: &str,
+    run_message: &str,
 ) -> Result<Option<GrantChoice>> {
     require_root()?;
+    validate_message(once_message)?;
+    validate_message(run_message)?;
     let deadline = deadline(config)?;
     verify_subject(subject)?;
-    ensure!(root_pid > 0, "invalid agent root PID");
     let session = active_session(config, subject, deadline)?;
     let account = account(subject.uid)?;
     let environment = desktop_environment(subject, &session, &account)?;
-    let mut command = clean_command(&trusted_executable(&config.zenity)?);
-    command.envs(environment);
-    let text = format!(
-        "An agent requests a secret. Administrator authentication is required next.\n\n\
-         Key: {}\nAgent: {}\nAgent root PID: {}\nRoot executable: {}\n\n\
-         Allow for this agent run applies only to this running agent, not future runs.",
-        escaped_label(key),
-        escaped_label(agent_name),
-        root_pid,
-        escaped_label(root_executable),
+    ensure!(
+        environment
+            .iter()
+            .any(|(k, _)| k == "DBUS_SESSION_BUS_ADDRESS"),
+        "desktop user manager unavailable"
     );
-    command.args([
-        "--list",
-        "--radiolist",
-        "--title=Agent Keyring",
-        "--width=640",
-        "--height=420",
-        "--column=Select",
-        "--column=Permission",
-        "--print-column=2",
-        "--ok-label=Continue",
-        "--cancel-label=Deny",
-    ]);
-    command.arg(format!("--text={text}"));
-    command.args([
-        "TRUE",
-        "Deny",
-        "FALSE",
-        "Allow once",
-        "FALSE",
-        "Allow for this agent run",
-    ]);
+    let agent = trusted_executable(&config.approval_agent)?;
+    let runner = trusted_executable(Path::new("/usr/bin/systemd-run"))?;
+    let systemctl = trusted_executable(Path::new("/usr/bin/systemctl"))?;
+    let env = trusted_executable(Path::new("/usr/bin/env"))?;
+    let pkcheck = trusted_executable(&config.pkcheck)?;
+    let request_id = request_id()?;
+    let unit = format!("agent-keyring-approval-{request_id}.service");
+    let mut command = approval_command(
+        &runner,
+        &env,
+        &agent,
+        subject,
+        &environment,
+        &unit,
+        &request_id,
+        once_message,
+        run_message,
+        config.timeout.as_secs().max(1),
+    );
+    let (input, liveness) = liveness_pipe()?;
+    command.stdin(Stdio::from(input));
     prepare_child(&mut command, Some((subject.uid, account.gid)));
-    let output = run(&mut command, deadline, Some(subject))?;
+    ensure!(Instant::now() < deadline, "authentication timed out");
+    let mut launcher = Running {
+        child: command.spawn().context("cannot start approval service")?,
+        reaped: false,
+    };
+    // Command retains the parent's read-end, not the private write capability.
+    drop(command);
+    let mut live = Some(liveness);
+    let mut parser = ApprovalParser::default();
+    let mut current = None;
+    let mut check = None;
+    let result: Result<Option<GrantChoice>> = (|| {
+        let mut stdout = launcher
+            .child
+            .stdout
+            .take()
+            .context("approval stdout missing")?;
+        nonblocking(stdout.as_raw_fd())?;
+        let mut checked = Instant::now();
+        let mut io = LiveApproval {
+            launcher: &mut launcher,
+            stdout: &mut stdout,
+            check: &mut check,
+            pkcheck: &pkcheck,
+            subject,
+            once_message,
+            run_message,
+            request_id: &request_id,
+            deadline,
+        };
+        loop {
+            if checked.elapsed() >= Duration::from_millis(100) {
+                verify_subject(subject)?;
+                checked = Instant::now();
+            }
+            if let Some(result) =
+                approval_tick(&mut io, &mut parser, &mut current, Instant::now(), deadline)?
+            {
+                return Ok(result);
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    })();
+    // Closing the sole writer is mandatory even on parser, launch or check error.
+    drop(live.take());
+    current.take();
+    let check_settled = stop_check(&mut check).is_ok();
+    let gui_settled = settle_gui(&mut launcher, &unit, parser.ready, |args| {
+        let mut command = clean_command(&systemctl);
+        command.envs(environment.iter().cloned());
+        command
+            .args(["--user", "--no-pager", "--no-ask-password"])
+            .args(args);
+        prepare_child(&mut command, Some((subject.uid, account.gid)));
+        run(&mut command, Instant::now() + Duration::from_secs(4), None)
+    });
+    if !check_settled || gui_settled.is_err() {
+        return Err(CleanupError.into());
+    }
+    let result = approval_outcome(result)?;
     verify_subject(subject)?;
     ensure!(
         active_session(config, subject, deadline)? == session,
         "desktop session changed"
     );
-    match output.status.code() {
-        Some(1) => Ok(None),
-        Some(0) => match output.stdout.as_slice() {
-            b"Deny\n" => Ok(None),
-            b"Allow once\n" => Ok(Some(GrantChoice::Once)),
-            b"Allow for this agent run\n" => Ok(Some(GrantChoice::Run)),
-            _ => bail!("unrecognized desktop choice"),
-        },
-        _ => bail!("desktop dialog failed"),
+    ensure!(Instant::now() < deadline, "authentication timed out");
+    Ok(result)
+}
+
+fn request_id() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn liveness_pipe() -> Result<(File, File)> {
+    let mut fds = [-1; 2];
+    ensure!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0,
+        "cannot create approval liveness pipe"
+    );
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approval_command(
+    runner: &Path,
+    env: &Path,
+    agent: &Path,
+    subject: &Subject,
+    environment: &[(OsString, OsString)],
+    unit: &str,
+    request_id: &str,
+    once_message: &str,
+    run_message: &str,
+    timeout: u64,
+) -> Command {
+    let mut command = clean_command(runner);
+    command
+        .envs(environment.iter().cloned())
+        .stderr(Stdio::null());
+    command.args([
+        "--user", "--pipe", "--wait", "--collect", "--quiet", "--no-ask-password",
+        "--service-type=exec", "--expand-environment=no", "--unit", unit,
+        "--property=LimitCORE=0", "--property=Restart=no", "--property=WorkingDirectory=/",
+        "--property=TimeoutStartSec=5s", "--property=TimeoutStopSec=2s",
+        "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
+        "--property=UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_PROFILE LD_ORIGIN_PATH LD_ASSUME_KERNEL LD_DYNAMIC_WEAK LD_BIND_NOW LD_BIND_NOT LD_HWCAP_MASK LD_SHOW_AUXV LD_USE_LOAD_BIAS GLIBC_TUNABLES GCONV_PATH LOCPATH POLKIT_DEBUG",
+    ]);
+    command.arg(format!("--property=RuntimeMaxSec={timeout}s"));
+    command
+        .arg("--")
+        .arg(env)
+        .args(["-i", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "PATH=/usr/bin:/bin"]);
+    for (name, value) in environment {
+        let mut assignment = name.clone();
+        assignment.push("=");
+        assignment.push(value);
+        command.arg(assignment);
     }
+    command
+        .arg(agent)
+        .arg("--pid")
+        .arg(subject.pid.to_string())
+        .arg("--start-time")
+        .arg(subject.start_time.to_string())
+        .arg("--uid")
+        .arg(subject.uid.to_string())
+        .arg("--request-id")
+        .arg(request_id)
+        .arg("--once-message")
+        .arg(once_message)
+        .arg("--run-message")
+        .arg(run_message)
+        .arg("--timeout-seconds")
+        .arg(timeout.to_string());
+    command
+}
+
+struct LiveApproval<'a> {
+    launcher: &'a mut Running,
+    stdout: &'a mut std::process::ChildStdout,
+    check: &'a mut Option<Running>,
+    pkcheck: &'a Path,
+    subject: &'a Subject,
+    once_message: &'a str,
+    run_message: &'a str,
+    request_id: &'a str,
+    deadline: Instant,
+}
+impl ApprovalIo for LiveApproval<'_> {
+    fn observe_gui(&mut self, parser: &mut ApprovalParser) -> Result<Vec<Attempt>> {
+        let mut choices = Vec::new();
+        let mut buffer = [0u8; 128];
+        loop {
+            match self.stdout.read(&mut buffer) {
+                Ok(0) => {
+                    ensure!(
+                        parser.line.is_empty(),
+                        "incomplete approval protocol record"
+                    );
+                    return Err(ApprovalClosed.into());
+                }
+                Ok(n) => choices.extend(parser.feed(&buffer[..n])?),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => bail!("approval protocol unavailable"),
+            }
+        }
+        ensure!(!self.launcher.exited()?, "approval service exited");
+        Ok(choices)
+    }
+    fn stop_check(&mut self) -> Result<()> {
+        stop_check(self.check)
+    }
+    fn start_check(&mut self, attempt: Attempt) -> Result<()> {
+        ensure!(Instant::now() < self.deadline, "authentication timed out");
+        ensure!(self.check.is_none(), "overlapping authorization checks");
+        let message = match attempt.scope {
+            GrantChoice::Once => self.once_message,
+            GrantChoice::Run => self.run_message,
+        };
+        let message = format!(
+            "{message}\n\nRequest: {}/{}",
+            self.request_id, attempt.sequence
+        );
+        let mut command = check_command(self.pkcheck, self.subject, READ_ACTION, &message)?;
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        *self.check = Some(Running {
+            child: command
+                .spawn()
+                .context("cannot start authorization check")?,
+            reaped: false,
+        });
+        Ok(())
+    }
+    fn check_result(&mut self) -> Result<Option<bool>> {
+        let Some(check) = self.check.as_mut() else {
+            return Ok(None);
+        };
+        if !check.exited()? {
+            return Ok(None);
+        }
+        // Retain the collected status while a fragmented next GUI record arrives.
+        let status = check.kill_and_reap().map_err(|_| CleanupError)?;
+        match status.code() {
+            Some(0) => Ok(Some(true)),
+            Some(1..=3) => Ok(Some(false)),
+            _ => bail!("polkit authorization check failed"),
+        }
+    }
+}
+
+fn stop_check(check: &mut Option<Running>) -> Result<()> {
+    if let Some(mut child) = check.take() {
+        child.kill_and_reap().map_err(|_| CleanupError)?;
+    }
+    Ok(())
+}
+
+fn settle_gui(
+    launcher: &mut Running,
+    unit: &str,
+    ready: bool,
+    mut query: impl FnMut(&[&str]) -> Result<Output>,
+) -> Result<()> {
+    let grace = Instant::now() + Duration::from_millis(200);
+    while matches!(launcher.exited(), Ok(false)) && Instant::now() < grace {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let exited = launcher.exited().unwrap_or(false);
+    // No late launcher submission may follow our exact-unit stop request. Still
+    // attempt manager cleanup if reaping fails, but never report that as settled.
+    let launcher_status = launcher.kill_and_reap();
+    let completed = exited && launcher_status.as_ref().is_ok_and(ExitStatus::success);
+    let stopped = query(&["stop", "--", unit]);
+    let state = query(&[
+        "show",
+        "--property=LoadState",
+        "--property=ActiveState",
+        "--",
+        unit,
+    ])?;
+    ensure!(launcher_status.is_ok(), "approval launcher cleanup unknown");
+    let stopped = stopped?;
+    ensure!(
+        state.status.success(),
+        "cannot confirm approval service state"
+    );
+    let text = std::str::from_utf8(&state.stdout).context("invalid service state")?;
+    let props = properties(text)?;
+    let absent = props.get("LoadState") == Some(&"not-found");
+    ensure!(
+        props.get("ActiveState") == Some(&"inactive") && (stopped.status.success() || absent),
+        "approval service not settled"
+    );
+    // Without READY or successful --wait completion, an interrupted/failed
+    // launcher may have lost its bus during submission. An absent unit alone
+    // cannot rule out a still-pending activation on that previous connection.
+    ensure!(ready || completed, "approval startup settlement unknown");
+    Ok(())
+}
+
+fn validate_message(message: &str) -> Result<()> {
+    ensure!(
+        !message.is_empty() && message.len() <= 8192,
+        "invalid authorization message length"
+    );
+    ensure!(
+        !message.chars().any(|c| c.is_control() && c != '\n'),
+        "invalid authorization message"
+    );
+    Ok(())
 }
 
 /// Independently ask polkit for authorization, as root, for the authenticated
@@ -160,27 +561,16 @@ pub fn choose_read(
 pub fn authorize(config: &Config, subject: &Subject, action: &str, message: &str) -> Result<bool> {
     require_root()?;
     validate_action(action)?;
-    ensure!(
-        !message.is_empty() && message.len() <= 8192,
-        "invalid authorization message length"
-    );
-    ensure!(
-        !message.chars().any(|c| c.is_control() && c != '\n'),
-        "invalid authorization message"
-    );
+    validate_message(message)?;
     let deadline = deadline(config)?;
     verify_subject(subject)?;
     let session = active_session(config, subject, deadline)?;
-    let mut command = clean_command(&trusted_executable(&config.pkcheck)?);
-    command.args([
-        "--action-id",
+    let mut command = check_command(
+        &trusted_executable(&config.pkcheck)?,
+        subject,
         action,
-        "--process",
-        &subject_argument(subject)?,
-    ]);
-    command.args(["--allow-user-interaction", "-d", "polkit.message", message]);
-    // No internal agent, shell, GUI credentials, or inherited D-Bus address.
-    prepare_child(&mut command, None);
+        message,
+    )?;
     let output = run(&mut command, deadline, Some(subject))?;
     verify_subject(subject)?;
     ensure!(
@@ -191,11 +581,27 @@ pub fn authorize(config: &Config, subject: &Subject, action: &str, message: &str
         Some(0) => Ok(true),
         Some(1..=3) => Ok(false),
         _ => bail!(
-            "polkit authorization check failed ({:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            "polkit authorization check failed ({:?})",
+            output.status.code()
         ),
     }
+}
+
+fn check_command(path: &Path, subject: &Subject, action: &str, message: &str) -> Result<Command> {
+    let mut command = clean_command(path);
+    command.args([
+        "--action-id",
+        action,
+        "--process",
+        &subject_argument(subject)?,
+        "--allow-user-interaction",
+        "-d",
+        "polkit.message",
+        message,
+    ]);
+    // No internal agent, shell, GUI credentials, or inherited D-Bus address.
+    prepare_child(&mut command, None);
+    Ok(command)
 }
 
 fn require_root() -> Result<()> {
@@ -226,7 +632,10 @@ fn subject_argument(subject: &Subject) -> Result<String> {
 }
 
 fn deadline(config: &Config) -> Result<Instant> {
-    ensure!(!config.timeout.is_zero(), "zero authentication timeout");
+    ensure!(
+        !config.timeout.is_zero() && config.timeout <= Duration::from_secs(300),
+        "invalid authentication timeout"
+    );
     Instant::now()
         .checked_add(config.timeout)
         .context("authentication timeout overflow")
@@ -542,35 +951,18 @@ fn desktop_environment(
     Ok(env)
 }
 
-fn escaped_label(input: &str) -> String {
-    let mut output = String::new();
-    for (index, c) in input.chars().enumerate() {
-        if index == 256 {
-            output.push('…');
-            break;
-        }
-        match c {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '\'' => output.push_str("&apos;"),
-            '"' => output.push_str("&quot;"),
-            // Also neutralize bidi and zero-width formatting that can spoof labels.
-            c if c.is_control()
-                || matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}') =>
-            {
-                output.push('�')
-            }
-            c => output.push(c),
-        }
-    }
-    output
+fn trusted_helper_mode(mode: u32) -> bool {
+    mode & 0o022 == 0 || (mode & libc::S_IFMT == libc::S_IFDIR && mode & libc::S_ISVTX != 0)
 }
 
 /// Resolve every symlink hop, checking both original and resolved ancestors.
 /// This accepts immutable root-owned Nix store executables, not user profiles.
 fn trusted_executable(path: &Path) -> Result<PathBuf> {
     ensure!(path.is_absolute(), "helper path must be absolute");
+    ensure!(
+        !path.components().any(|c| matches!(c, Component::ParentDir)),
+        "helper path must not contain traversal"
+    );
     let mut pending = path.to_path_buf();
     let mut links = 0;
     'resolve: loop {
@@ -611,8 +1003,11 @@ fn trusted_executable(path: &Path) -> Result<PathBuf> {
                 pending = next;
                 continue 'resolve;
             }
+            // Root ownership was checked above. A sticky root-owned ancestor
+            // (notably /nix/store) cannot have its root-owned entries replaced
+            // by the other users allowed to create siblings there.
             ensure!(
-                meta.mode() & 0o022 == 0,
+                trusted_helper_mode(meta.mode()),
                 "helper path is writable by non-root"
             );
             if index + 1 == components.len() {
@@ -668,9 +1063,9 @@ fn prepare_child(command: &mut Command, identity: Option<(u32, u32)>) {
                 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(io::Error::last_os_error());
             }
             // Credential changes clear PDEATHSIG, so install it afterward.
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
@@ -687,21 +1082,57 @@ fn prepare_child(command: &mut Command, identity: Option<(u32, u32)>) {
 struct Output {
     status: ExitStatus,
     stdout: Vec<u8>,
-    stderr: Vec<u8>,
 }
 struct Running {
     child: Child,
     reaped: bool,
 }
 impl Running {
+    fn exited(&self) -> io::Result<bool> {
+        if self.reaped {
+            return Ok(true);
+        }
+        // WNOWAIT pins the process-group identity until cleanup, even at exit 0.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        loop {
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                return Ok(unsafe { info.si_pid() } != 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
     fn kill_and_reap(&mut self) -> io::Result<ExitStatus> {
-        // The direct child has NOT been reaped: its PID/process-group ID cannot
-        // have been recycled into an unrelated process, even on normal exit.
+        // Child::wait caches a previously collected status. Never signal its
+        // potentially recycled PID/group a second time.
+        if self.reaped {
+            return self.child.wait();
+        }
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
         let _ = self.child.kill();
-        let status = self.child.wait()?;
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        while !self.exited()? {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "helper cleanup timed out",
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let status = self.child.wait()?; // WNOWAIT proved this cannot block.
         self.reaped = true;
         Ok(status)
     }
@@ -722,59 +1153,74 @@ fn run(command: &mut Command, deadline: Instant, subject: Option<&Subject>) -> R
             .context("cannot start authentication helper")?,
         reaped: false,
     };
-    let mut stdout = child.child.stdout.take().context("helper stdout missing")?;
-    let mut stderr = child.child.stderr.take().context("helper stderr missing")?;
-    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        ensure!(
-            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0,
-            "cannot configure helper output"
-        );
-    }
-    let mut data = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut checked = Instant::now();
-    loop {
-        ensure!(Instant::now() < deadline, "authentication timed out");
-        if checked.elapsed() >= Duration::from_millis(100) {
-            if let Some(subject) = subject {
-                verify_subject(subject)?;
-            }
-            checked = Instant::now();
+    let result = (|| {
+        let mut stdout = child.child.stdout.take().context("helper stdout missing")?;
+        let mut stderr = child.child.stderr.take().context("helper stderr missing")?;
+        for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            ensure!(
+                flags >= 0
+                    && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0,
+                "cannot configure helper output"
+            );
         }
-        drain(&mut stdout, &mut data)?;
-        drain(&mut stderr, &mut diagnostics)?;
-        // WNOWAIT retains the child PID until we have killed its process group.
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.child.id(),
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
+        let mut data = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut checked = Instant::now();
+        loop {
+            ensure!(Instant::now() < deadline, "authentication timed out");
+            if checked.elapsed() >= Duration::from_millis(100) {
+                if let Some(subject) = subject {
+                    verify_subject(subject)?;
+                }
+                checked = Instant::now();
             }
-            return Err(error.into());
-        }
-        if unsafe { info.si_pid() } != 0 {
-            let status = child.kill_and_reap()?;
             drain(&mut stdout, &mut data)?;
             drain(&mut stderr, &mut diagnostics)?;
-            return Ok(Output {
-                status,
-                stdout: data,
-                stderr: diagnostics,
-            });
+            // WNOWAIT retains the child PID until we have killed its process group.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if unsafe { info.si_pid() } != 0 {
+                let status = child.kill_and_reap()?;
+                drain(&mut stdout, &mut data)?;
+                drain(&mut stderr, &mut diagnostics)?;
+                return Ok(Output {
+                    status,
+                    stdout: data,
+                });
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
-        thread::sleep(
-            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
-        );
+    })();
+    if !child.reaped && child.kill_and_reap().is_err() {
+        return Err(CleanupError.into());
     }
+    result
+}
+
+fn nonblocking(fd: i32) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    ensure!(
+        flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0,
+        "cannot configure helper output"
+    );
+    Ok(())
 }
 
 fn drain(reader: &mut impl Read, output: &mut Vec<u8>) -> Result<()> {
@@ -801,10 +1247,643 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[derive(Default)]
+    struct FakeProcesses {
+        gui: std::collections::VecDeque<Option<Vec<u8>>>,
+        child: Option<Attempt>,
+        results: HashMap<u32, bool>,
+        events: Vec<String>,
+        cleanup_fails: bool,
+    }
+    impl FakeProcesses {
+        fn bytes(&mut self, text: &str) {
+            self.gui.push_back(Some(text.as_bytes().to_vec()));
+        }
+    }
+    impl ApprovalIo for FakeProcesses {
+        fn observe_gui(&mut self, parser: &mut ApprovalParser) -> Result<Vec<Attempt>> {
+            match self.gui.pop_front() {
+                Some(Some(bytes)) => parser.feed(&bytes),
+                Some(None) => bail!("approval window closed"),
+                None => Ok(Vec::new()),
+            }
+        }
+        fn stop_check(&mut self) -> Result<()> {
+            if self.cleanup_fails {
+                return Err(CleanupError.into());
+            }
+            if let Some(attempt) = self.child.take() {
+                self.events.push(format!("reap {}", attempt.sequence));
+            }
+            Ok(())
+        }
+        fn start_check(&mut self, attempt: Attempt) -> Result<()> {
+            assert!(
+                self.child.is_none(),
+                "second live check before old child reaped"
+            );
+            self.events.push(format!("start {}", attempt.sequence));
+            self.child = Some(attempt);
+            Ok(())
+        }
+        fn check_result(&mut self) -> Result<Option<bool>> {
+            Ok(self
+                .child
+                .and_then(|a| self.results.get(&a.sequence).copied()))
+        }
+    }
+    fn tick(
+        io: &mut FakeProcesses,
+        parser: &mut ApprovalParser,
+        current: &mut Option<Attempt>,
+    ) -> Result<Option<Option<GrantChoice>>> {
+        let now = Instant::now();
+        approval_tick(io, parser, current, now, now + Duration::from_secs(1))
+    }
+
+    #[test]
+    fn explicit_cancel_is_observed_without_waiting_for_service_eof() {
+        let mut parser = ApprovalParser::default();
+        parser.feed(b"READY\nCHOICE 1 once\nCAN").unwrap();
+        let error = parser.feed(b"CEL\n").unwrap_err();
+        assert!(error.is::<ApprovalClosed>());
+        assert_eq!(approval_outcome(Err(error)).unwrap(), None);
+        assert!(
+            !ApprovalParser::default()
+                .feed(b"CANCEL\n")
+                .unwrap_err()
+                .is::<ApprovalClosed>()
+        );
+    }
+
+    #[test]
+    fn approval_parser_fragmented_and_coalesced_records() {
+        let stream = b"READY\nCHOICE 1 once\nCHOICE 2 run\nCHOICE 3 once\n";
+        let expected = vec![
+            Attempt {
+                sequence: 1,
+                scope: GrantChoice::Once,
+            },
+            Attempt {
+                sequence: 2,
+                scope: GrantChoice::Run,
+            },
+            Attempt {
+                sequence: 3,
+                scope: GrantChoice::Once,
+            },
+        ];
+        for split in 0..=stream.len() {
+            let mut parser = ApprovalParser::default();
+            let mut actual = parser.feed(&stream[..split]).unwrap();
+            actual.extend(parser.feed(&stream[split..]).unwrap());
+            assert_eq!(actual, expected);
+        }
+        let mut parser = ApprovalParser::default();
+        let actual: Vec<_> = stream
+            .iter()
+            .flat_map(|b| parser.feed(&[*b]).unwrap())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn approval_parser_rejects_order_injection_and_floods_without_echoing() {
+        for stream in [
+            "CHOICE 1 once\n",
+            "READY\nREADY\n",
+            "READY\nCHOICE 1 run\n",
+            "READY\nCHOICE 0 once\n",
+            "READY\nCHOICE 2 once\n",
+            "READY\nCHOICE 01 once\n",
+            "READY\nCHOICE 1 once\nCHOICE 1 run\n",
+            "READY\nCHOICE 1 once extra\n",
+            "READY\nAUTHORIZED\n",
+            "READY\nCHOICE 1 Once\n",
+            "READY\r\n",
+            "READY\0\n",
+            "READY\nprivate-password-must-not-be-logged\n",
+            "READY\nCHOICE 1 oncé\n",
+        ] {
+            let error = ApprovalParser::default()
+                .feed(stream.as_bytes())
+                .unwrap_err();
+            assert!(!format!("{error:#}").contains("private-password"));
+        }
+        assert!(
+            ApprovalParser::default()
+                .feed(&[b'x'; LINE_LIMIT + 1])
+                .is_err()
+        );
+        assert!(
+            ApprovalParser::default()
+                .feed(&[b'x'; PROTOCOL_LIMIT + 1])
+                .is_err()
+        );
+        let mut parser = ApprovalParser::default();
+        parser.feed(b"READY\n").unwrap();
+        for sequence in 1..=MAX_CHOICES {
+            parser
+                .feed(format!("CHOICE {sequence} once\n").as_bytes())
+                .unwrap();
+        }
+        assert!(parser.feed(b"CHOICE 17 once\n").is_err());
+    }
+
+    #[test]
+    fn scope_changes_invalidate_old_success_before_reap_and_new_launch() {
+        for scopes in [
+            [GrantChoice::Once, GrantChoice::Run],
+            [GrantChoice::Once, GrantChoice::Once],
+            [GrantChoice::Run, GrantChoice::Once],
+        ] {
+            for arrives_after_status in [false, true] {
+                let mut io = FakeProcesses::default();
+                let mut parser = ApprovalParser::default();
+                let mut current = None;
+                io.bytes("READY\nCHOICE 1 once\n");
+                assert_eq!(tick(&mut io, &mut parser, &mut current).unwrap(), None);
+                let old = if scopes[0] == GrantChoice::Run {
+                    io.bytes("CHOICE 2 run\n");
+                    tick(&mut io, &mut parser, &mut current).unwrap();
+                    2
+                } else {
+                    1
+                };
+                io.results.insert(old, true);
+                if arrives_after_status {
+                    io.bytes("");
+                }
+                let scope = if scopes[1] == GrantChoice::Run {
+                    "run"
+                } else {
+                    "once"
+                };
+                io.bytes(&format!("CHOICE {} {scope}\n", old + 1));
+                assert_eq!(tick(&mut io, &mut parser, &mut current).unwrap(), None);
+                assert_eq!(
+                    current,
+                    Some(Attempt {
+                        sequence: old + 1,
+                        scope: scopes[1]
+                    })
+                );
+                assert!(
+                    io.events
+                        .ends_with(&[format!("reap {old}"), format!("start {}", old + 1)])
+                );
+                // Repeated observation of the superseded successful child has no authority.
+                assert_eq!(tick(&mut io, &mut parser, &mut current).unwrap(), None);
+                io.results.insert(old + 1, true);
+                assert_eq!(
+                    tick(&mut io, &mut parser, &mut current).unwrap(),
+                    Some(Some(scopes[1]))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gui_death_and_malformed_output_precede_simultaneous_check_success() {
+        for after_status in [false, true] {
+            for data in [None, Some(b"credential-adjacent-invalid-record\n".to_vec())] {
+                let mut io = FakeProcesses::default();
+                let mut parser = ApprovalParser::default();
+                let mut current = None;
+                io.bytes("READY\nCHOICE 1 once\n");
+                tick(&mut io, &mut parser, &mut current).unwrap();
+                io.results.insert(1, true);
+                if after_status {
+                    io.bytes("");
+                }
+                io.gui.push_back(data);
+                assert!(tick(&mut io, &mut parser, &mut current).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn gui_preferences_ready_and_exit_never_authorize() {
+        let mut io = FakeProcesses::default();
+        let mut parser = ApprovalParser::default();
+        let mut current = None;
+        io.bytes("READY\n");
+        assert_eq!(tick(&mut io, &mut parser, &mut current).unwrap(), None);
+        assert!(io.child.is_none());
+        io.bytes("CHOICE 1 once\nCHOICE 2 run\n");
+        assert_eq!(tick(&mut io, &mut parser, &mut current).unwrap(), None);
+        io.results.insert(2, false);
+        assert_eq!(
+            tick(&mut io, &mut parser, &mut current).unwrap(),
+            Some(None)
+        );
+        io.gui.push_back(None);
+        assert!(tick(&mut io, &mut parser, &mut current).is_err());
+    }
+
+    #[test]
+    fn fragmented_next_choice_blocks_old_success_and_eof_cancels() {
+        let mut io = FakeProcesses::default();
+        let mut parser = ApprovalParser::default();
+        let mut current = None;
+        io.bytes("READY\nCHOICE 1 once\n");
+        tick(&mut io, &mut parser, &mut current).unwrap();
+        io.results.insert(1, true);
+        io.bytes("CHOI");
+        assert_eq!(tick(&mut io, &mut parser, &mut current).unwrap(), None);
+        io.bytes("CE 2 run\n");
+        assert_eq!(tick(&mut io, &mut parser, &mut current).unwrap(), None);
+        io.gui.push_back(None);
+        assert!(tick(&mut io, &mut parser, &mut current).is_err());
+    }
+
+    #[test]
+    fn original_deadline_beats_even_current_success() {
+        let mut io = FakeProcesses::default();
+        let mut parser = ApprovalParser::default();
+        let mut current = None;
+        io.bytes("READY\nCHOICE 1 once\nCHOICE 2 run\n");
+        tick(&mut io, &mut parser, &mut current).unwrap();
+        io.results.insert(2, true);
+        let deadline = Instant::now();
+        assert!(approval_tick(&mut io, &mut parser, &mut current, deadline, deadline).is_err());
+    }
+
+    #[test]
+    fn unknown_check_cleanup_invalidates_and_never_launches_replacement() {
+        let mut io = FakeProcesses::default();
+        let mut parser = ApprovalParser::default();
+        let mut current = None;
+        io.bytes("READY\nCHOICE 1 once\n");
+        tick(&mut io, &mut parser, &mut current).unwrap();
+        io.results.insert(1, true);
+        io.cleanup_fails = true;
+        io.bytes("CHOICE 2 run\n");
+        let error = tick(&mut io, &mut parser, &mut current).unwrap_err();
+        assert!(error.is::<CleanupError>());
+        assert_eq!(current, None);
+        assert_eq!(io.events, ["start 1"]);
+    }
+
+    #[test]
+    fn service_launch_argv_is_literal_and_hardened() {
+        let subject = Subject {
+            pid: 42,
+            uid: 1000,
+            start_time: 123,
+        };
+        let once = "once $HOME ${HOME} $$ %u \\ \"\n--option";
+        let run = "run message";
+        let environment = vec![("HOME".into(), "/home/literal $ %".into())];
+        let command = approval_command(
+            Path::new("/usr/bin/systemd-run"),
+            Path::new("/usr/bin/env"),
+            Path::new("/trusted/agent"),
+            &subject,
+            &environment,
+            "agent-keyring-approval-0123456789abcdef0123456789abcdef.service",
+            "0123456789abcdef0123456789abcdef",
+            once,
+            run,
+            60,
+        );
+        let args: Vec<_> = command.get_args().map(|x| x.to_str().unwrap()).collect();
+        for arg in [
+            "--user",
+            "--pipe",
+            "--wait",
+            "--collect",
+            "--quiet",
+            "--no-ask-password",
+            "--service-type=exec",
+            "--expand-environment=no",
+            "--property=LimitCORE=0",
+            "--property=Restart=no",
+            "--property=TimeoutStartSec=5s",
+            "--property=RuntimeMaxSec=60s",
+            "--property=TimeoutStopSec=2s",
+            "--property=KillMode=control-group",
+            "--property=SendSIGKILL=yes",
+            "HOME=/home/literal $ %",
+        ] {
+            assert!(args.contains(&arg), "{arg}");
+        }
+        assert!(!args.contains(&"--scope"));
+        assert!(
+            args.iter()
+                .any(|x| x.starts_with("--property=UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH"))
+        );
+        let agent = args.iter().position(|x| *x == "/trusted/agent").unwrap();
+        assert_eq!(
+            &args[agent + 1..],
+            [
+                "--pid",
+                "42",
+                "--start-time",
+                "123",
+                "--uid",
+                "1000",
+                "--request-id",
+                "0123456789abcdef0123456789abcdef",
+                "--once-message",
+                once,
+                "--run-message",
+                run,
+                "--timeout-seconds",
+                "60"
+            ]
+        );
+        let env = args.iter().position(|x| *x == "/usr/bin/env").unwrap();
+        assert_eq!(
+            &args[env - 1..env + 5],
+            [
+                "--",
+                "/usr/bin/env",
+                "-i",
+                "LANG=C.UTF-8",
+                "LC_ALL=C.UTF-8",
+                "PATH=/usr/bin:/bin"
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(Path::new("/")));
+    }
+
+    #[test]
+    fn liveness_writer_is_private_and_cloexec_and_stdin_eof_settles_child() {
+        let (input, writer) = liveness_pipe().unwrap();
+        for fd in [input.as_raw_fd(), writer.as_raw_fd()] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+        // Another concurrently launched helper must not retain this request's writer.
+        let probe = thread::current().name().unwrap().replace(
+            "liveness_writer_is_private_and_cloexec_and_stdin_eof_settles_child",
+            "inherited_fd_probe",
+        );
+        let mut other = clean_command(&std::env::current_exe().unwrap());
+        other
+            .args(["--exact", &probe])
+            .env("AUTH_TEST_FD", writer.as_raw_fd().to_string());
+        prepare_child(&mut other, None);
+        assert!(
+            run(&mut other, Instant::now() + Duration::from_secs(2), None)
+                .unwrap()
+                .status
+                .success()
+        );
+        let mut command = clean_command(Path::new("/usr/bin/cat"));
+        command.stdin(Stdio::from(input)).stderr(Stdio::null());
+        prepare_child(&mut command, None);
+        let mut child = Running {
+            child: command.spawn().unwrap(),
+            reaped: false,
+        };
+        drop(command);
+        assert!(!child.exited().unwrap());
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !child.exited().unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(child.exited().unwrap(), "an inherited writer prevented EOF");
+        assert!(child.kill_and_reap().unwrap().success());
+        assert!(child.kill_and_reap().unwrap().success()); // cached, no recycled PID signal
+    }
+
+    #[test]
+    fn live_protocol_eof_with_successful_check_is_not_authority() {
+        let mut gui = clean_command(Path::new("/usr/bin/printf"));
+        gui.args(["%s", "READY\nCHOICE 1 once\n"]);
+        prepare_child(&mut gui, None);
+        let mut launcher = Running {
+            child: gui.spawn().unwrap(),
+            reaped: false,
+        };
+        let mut stdout = launcher.child.stdout.take().unwrap();
+        nonblocking(stdout.as_raw_fd()).unwrap();
+        let until = Instant::now() + Duration::from_secs(1);
+        while !launcher.exited().unwrap() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(launcher.exited().unwrap());
+        let mut command = clean_command(Path::new("/usr/bin/true"));
+        prepare_child(&mut command, None);
+        let mut check = Some(Running {
+            child: command.spawn().unwrap(),
+            reaped: false,
+        });
+        let subject = Subject {
+            pid: 1,
+            uid: 1000,
+            start_time: 1,
+        };
+        let mut io = LiveApproval {
+            launcher: &mut launcher,
+            stdout: &mut stdout,
+            check: &mut check,
+            pkcheck: Path::new("/usr/bin/false"),
+            subject: &subject,
+            once_message: "once",
+            run_message: "run",
+            request_id: "0123456789abcdef0123456789abcdef",
+            deadline: until,
+        };
+        assert!(
+            approval_tick(
+                &mut io,
+                &mut ApprovalParser::default(),
+                &mut None,
+                Instant::now(),
+                until
+            )
+            .is_err()
+        );
+        stop_check(&mut check).unwrap();
+    }
+
+    #[test]
+    fn exact_unit_stop_and_confirmed_inactive_state_are_required() {
+        use std::os::unix::process::ExitStatusExt;
+        for (ready, stop_ok, show_ok, state, expected) in [
+            (
+                true,
+                true,
+                true,
+                "LoadState=loaded\nActiveState=inactive\n",
+                true,
+            ),
+            (
+                true,
+                false,
+                true,
+                "LoadState=not-found\nActiveState=inactive\n",
+                true,
+            ),
+            (
+                true,
+                false,
+                true,
+                "LoadState=loaded\nActiveState=inactive\n",
+                false,
+            ),
+            (
+                true,
+                true,
+                true,
+                "LoadState=loaded\nActiveState=active\n",
+                false,
+            ),
+            (
+                true,
+                true,
+                true,
+                "LoadState=loaded\nActiveState=deactivating\n",
+                false,
+            ),
+            (
+                true,
+                true,
+                true,
+                "LoadState=loaded\nActiveState=failed\n",
+                false,
+            ),
+            (
+                true,
+                true,
+                false,
+                "LoadState=not-found\nActiveState=inactive\n",
+                false,
+            ),
+            (
+                false,
+                true,
+                true,
+                "LoadState=not-found\nActiveState=inactive\n",
+                false,
+            ),
+        ] {
+            let mut command = clean_command(Path::new("/usr/bin/sleep"));
+            command.arg("10");
+            prepare_child(&mut command, None);
+            let mut launcher = Running {
+                child: command.spawn().unwrap(),
+                reaped: false,
+            };
+            let pid = launcher.child.id() as i32;
+            let mut calls = Vec::new();
+            let result = settle_gui(
+                &mut launcher,
+                "agent-keyring-approval-test.service",
+                ready,
+                |args| {
+                    // Even an unresponsive launcher is gone before manager stop.
+                    assert_eq!(
+                        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+                        -1
+                    );
+                    assert_eq!(
+                        io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ECHILD)
+                    );
+                    calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                    let success = if args[0] == "stop" { stop_ok } else { show_ok };
+                    Ok(Output {
+                        status: ExitStatus::from_raw(if success { 0 } else { 256 }),
+                        stdout: if args[0] == "show" {
+                            state.as_bytes().to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                },
+            );
+            assert_eq!(result.is_ok(), expected, "{state}");
+            assert_eq!(
+                calls,
+                [
+                    vec!["stop", "--", "agent-keyring-approval-test.service"],
+                    vec![
+                        "show",
+                        "--property=LoadState",
+                        "--property=ActiveState",
+                        "--",
+                        "agent-keyring-approval-test.service"
+                    ]
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_unacknowledged_launcher_is_not_proof_of_settlement() {
+        use std::os::unix::process::ExitStatusExt;
+        for executable in ["/usr/bin/true", "/usr/bin/false"] {
+            let mut command = clean_command(Path::new(executable));
+            prepare_child(&mut command, None);
+            let mut launcher = Running {
+                child: command.spawn().unwrap(),
+                reaped: false,
+            };
+            let until = Instant::now() + Duration::from_secs(1);
+            while !launcher.exited().unwrap() && Instant::now() < until {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(launcher.exited().unwrap());
+            let result = settle_gui(
+                &mut launcher,
+                "agent-keyring-approval-test.service",
+                false,
+                |_| {
+                    Ok(Output {
+                        status: ExitStatus::from_raw(0),
+                        stdout: b"LoadState=not-found\nActiveState=inactive\n".to_vec(),
+                    })
+                },
+            );
+            assert_eq!(result.is_ok(), executable == "/usr/bin/true");
+        }
+    }
+
+    #[test]
+    fn polkit_check_uses_exact_subject_message_and_no_internal_agent() {
+        let subject = Subject {
+            pid: 42,
+            start_time: 123,
+            uid: 1000,
+        };
+        let message = "Allow root PID 99 started 555 key synthetic version 1 once?\n\nRequest: 0123456789abcdef0123456789abcdef/1";
+        let command = check_command(
+            Path::new("/usr/bin/pkcheck"),
+            &subject,
+            READ_ACTION,
+            message,
+        )
+        .unwrap();
+        let args: Vec<_> = command.get_args().map(|x| x.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "--action-id",
+                READ_ACTION,
+                "--process",
+                "42,123,1000",
+                "--allow-user-interaction",
+                "-d",
+                "polkit.message",
+                message
+            ]
+        );
+    }
+
     #[test]
     fn defaults_are_absolute_and_bounded() {
         let c = Config::default();
-        assert_eq!(c.zenity, Path::new("/usr/bin/zenity"));
+        assert_eq!(
+            c.approval_agent,
+            Path::new("/usr/local/libexec/agent-keyring-approval")
+        );
         assert_eq!(c.pkcheck, Path::new("/usr/bin/pkcheck"));
         assert_eq!(c.loginctl, Path::new("/usr/bin/loginctl"));
         assert_eq!(c.timeout, Duration::from_secs(60));
@@ -842,16 +1921,18 @@ mod tests {
     }
 
     #[test]
-    fn labels_are_escaped_bounded_and_not_spoofable() {
+    fn window_close_is_denial_but_protocol_and_cleanup_failures_are_not() {
+        assert_eq!(approval_outcome(Err(ApprovalClosed.into())).unwrap(), None);
+        assert!(approval_outcome(Err(CleanupError.into())).is_err());
+        assert!(approval_outcome(Err(anyhow::anyhow!("invalid protocol"))).is_err());
         assert_eq!(
-            escaped_label("<&>\"'\n\u{202e}"),
-            "&lt;&amp;&gt;&quot;&apos;��"
+            approval_outcome(Ok(Some(GrantChoice::Once))).unwrap(),
+            Some(GrantChoice::Once)
         );
         assert_eq!(
-            escaped_label(&"a".repeat(257)),
-            format!("{}…", "a".repeat(256))
+            approval_outcome(Ok(Some(GrantChoice::Run))).unwrap(),
+            Some(GrantChoice::Run)
         );
-        assert_eq!(escaped_label("café"), "café");
     }
 
     fn session_text() -> &'static str {
@@ -992,6 +2073,17 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn sticky_ancestor_exception_never_allows_writable_executable_files() {
+        assert!(trusted_helper_mode(libc::S_IFDIR | 0o1775));
+        assert!(trusted_helper_mode(libc::S_IFDIR | 0o1777));
+        assert!(trusted_helper_mode(libc::S_IFDIR | 0o755));
+        assert!(trusted_helper_mode(libc::S_IFREG | 0o555));
+        assert!(!trusted_helper_mode(libc::S_IFDIR | 0o775));
+        assert!(!trusted_helper_mode(libc::S_IFREG | 0o1775));
+        assert!(!trusted_helper_mode(libc::S_IFREG | 0o775));
     }
 
     #[test]

@@ -327,60 +327,37 @@ impl Broker {
         }
         let epoch = *state.revocation_epochs.get(&peer.uid).unwrap_or(&0);
         drop(state);
-        let Some(_prompt) = PromptGuard::acquire(&self.prompting, peer.uid) else {
+        let Some(mut prompt) = PromptGuard::acquire(&self.prompting, peer.uid) else {
             return error(
                 ErrorCode::Unavailable,
-                "another approval is pending for this user; retry afterward",
+                "another approval is pending or cleanup is unconfirmed for this user",
             );
         };
-        let choice = match auth::choose_read(
+        let message = |scope| {
+            format!(
+                "Allow {} (PID {}, started {}) to read secret {} version {} for {}? The agent will receive the secret, not root privileges.",
+                root.1.name, root.1.pid, root.1.start_time, key, metadata.version, scope
+            )
+        };
+        let choice = match auth::approve_read(
             &self.auth,
             subject,
-            key,
-            &root.1.name,
-            root.1.pid,
-            &root.1.executable,
+            &message("this one request"),
+            &message("this agent process and its live descendants until it exits"),
         ) {
             Ok(Some(choice)) => choice,
-            Ok(None) => return error(ErrorCode::Denied, "request denied"),
+            Ok(None) => return error(ErrorCode::Denied, "administrator authorization denied"),
             Err(failure) => {
-                eprintln!(
-                    "approval GUI unavailable for uid {}: {failure:#}",
-                    subject.uid
-                );
+                if failure.is::<auth::CleanupError>() {
+                    prompt.keep();
+                }
+                eprintln!("approval unavailable for uid {}: {failure:#}", subject.uid);
                 return error(
                     ErrorCode::Unavailable,
-                    "approval GUI unavailable; requires an active unlocked local desktop",
+                    "approval unavailable; requires a local unlocked desktop, user manager and installed policy",
                 );
             }
         };
-        let scope = match choice {
-            GrantChoice::Once => "this one request",
-            GrantChoice::Run => "this agent process and its live descendants until it exits",
-        };
-        let message = format!(
-            "Allow {} (PID {}, started {}) to read secret {} version {} for {}? The agent will receive the secret, not root privileges.",
-            root.1.name, root.1.pid, root.1.start_time, key, metadata.version, scope
-        );
-        match auth::authorize(
-            &self.auth,
-            subject,
-            "io.github.from-nibly.agent-keyring.read",
-            &message,
-        ) {
-            Ok(true) => {}
-            Ok(false) => return error(ErrorCode::Denied, "administrator authorization denied"),
-            Err(failure) => {
-                eprintln!(
-                    "administrator authorization unavailable for uid {}: {failure:#}",
-                    subject.uid
-                );
-                return error(
-                    ErrorCode::Unavailable,
-                    "administrator authorization unavailable; check the polkit agent and installed policy",
-                );
-            }
-        }
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => return error(ErrorCode::Internal, "state unavailable"),
@@ -474,7 +451,7 @@ impl Broker {
                 Err(failure) => return storage_error(failure),
             }
         };
-        let Some(_prompt) = PromptGuard::acquire(&self.prompting, subject.uid) else {
+        let Some(mut prompt) = PromptGuard::acquire(&self.prompting, subject.uid) else {
             return error(
                 ErrorCode::Unavailable,
                 "another approval is pending for this user; retry afterward",
@@ -493,6 +470,9 @@ impl Broker {
             Ok(true) => {}
             Ok(false) => return error(ErrorCode::Denied, "administrator authorization denied"),
             Err(failure) => {
+                if failure.is::<auth::CleanupError>() {
+                    prompt.keep();
+                }
                 eprintln!(
                     "administrator authorization unavailable for uid {}: {failure:#}",
                     subject.uid
@@ -623,17 +603,28 @@ fn select_root(state: &State, ancestry: &Ancestry, uid: u32) -> Option<(ProcessI
 struct PromptGuard<'a> {
     prompts: &'a Mutex<HashSet<u32>>,
     uid: u32,
+    keep: bool,
 }
 impl<'a> PromptGuard<'a> {
     fn acquire(prompts: &'a Mutex<HashSet<u32>>, uid: u32) -> Option<Self> {
         if !prompts.lock().ok()?.insert(uid) {
             return None;
         }
-        Some(Self { prompts, uid })
+        Some(Self {
+            prompts,
+            uid,
+            keep: false,
+        })
+    }
+    fn keep(&mut self) {
+        self.keep = true;
     }
 }
 impl Drop for PromptGuard<'_> {
     fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
         if let Ok(mut prompts) = self.prompts.lock() {
             prompts.remove(&self.uid);
         }
@@ -889,6 +880,15 @@ mod tests {
         assert!(PromptGuard::acquire(&prompts, 1001).is_some());
         drop(first);
         assert!(PromptGuard::acquire(&prompts, 1000).is_some());
+    }
+    #[test]
+    fn unconfirmed_cleanup_keeps_owner_fenced_after_request_returns() {
+        let prompts = Mutex::new(HashSet::new());
+        let mut guard = PromptGuard::acquire(&prompts, 1000).unwrap();
+        guard.keep();
+        drop(guard);
+        assert!(PromptGuard::acquire(&prompts, 1000).is_none());
+        assert!(PromptGuard::acquire(&prompts, 1001).is_some());
     }
     #[test]
     fn socket_paths_reject_user_owned_directories() {
