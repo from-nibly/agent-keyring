@@ -112,11 +112,36 @@ Verified:
    restart. Polkit logs report ONE-SHOT authorization for the read and replacement
    actions, not retained authentication.
 
+## 0.3.0 dual-desktop automated checks (2026-10-13)
+
+On the Framework NixOS host, `cargo test` passed 92 tests and
+`cargo clippy --all-targets -- -D warnings` passed using Rust 1.95.0. Native
+GUI packaging with `helperDirectory=/run/wrappers/bin` built successfully and
+passed all 15 synthetic Xvfb tests. GTK 3.24.52 source confirms native Wayland
+app_id defaults to `g_get_prgname()`, set to `AgentKeyringApproval` by the GUI.
+
+New tests cover both session types, remote/locked/inactive/unsupported sessions,
+UID mismatch, absent/wrong runtime environment, cross-session hints, missing,
+symlinked or non-socket endpoints, private runtime permissions, and owned
+compositor/session-bus sockets. Existing exact-request, stale-generation,
+process identity, cancellation and unconfirmed-cleanup fencing tests still pass.
+Coreutils subprocess fixtures now resolve installed host paths on NixOS too.
+The installed `/usr/bin/pkcheck` argument probe is skipped when that path is
+absent; unit success is not host polkit integration verification.
+
+No real desktop approval, password authentication, native Wayland window,
+lock/session restart, suspend or vault modification was performed for this
+version. Follow `gui/TESTING.md` for separate operator-controlled acceptance.
+Earlier live X11 verification above describes the earlier version, not a new
+live regression run for 0.3.0.
+
 ## Limits
 
 This is not a formal security audit. Root and the desktop remain trusted; there
 is no sandbox or resistance to existing host-root privileges. The vault is not
 encrypted at rest. Real Claude/Codex launch topologies, other desktops and older
-kernels have not been exercised. Wayland-only/headless/remote sessions fail
-closed. Screen-lock hints depend on the desktop's logind integration. Revocation
+kernels have not been exercised. Since 0.3.0, native Wayland session/socket
+validation is supported, but live native Wayland approval has not yet been
+verified. Headless/remote/inactive/locked sessions fail closed. Screen-lock hints
+depend on the desktop's logind integration. Revocation
 cannot retract bytes already authorized or released.

@@ -12,7 +12,7 @@
 //! observe dialogs; same-UID processes can tamper with the GUI and its environment.
 //! Neither GUI output nor this module makes Docker/root-equivalent users safe.
 //! Password entry belongs to the registered polkit agent, never to this daemon.
-//! X11 is supported; Wayland-only/headless sessions fail closed. A local active
+//! X11 and native Wayland are supported; headless sessions fail closed. A local active
 //! logind session and a registered authentication agent are prerequisites. User
 //! service processes require polkit's logind UID-to-display-session fallback;
 //! older builds without it fail closed rather than changing the polkit subject.
@@ -58,6 +58,9 @@ pub struct Config {
     pub approval_agent: PathBuf,
     pub pkcheck: PathBuf,
     pub loginctl: PathBuf,
+    pub systemd_run: PathBuf,
+    pub systemctl: PathBuf,
+    pub env: PathBuf,
     pub timeout: Duration,
 }
 
@@ -67,6 +70,9 @@ impl Default for Config {
             approval_agent: "/usr/local/libexec/agent-keyring-approval".into(),
             pkcheck: "/usr/bin/pkcheck".into(),
             loginctl: "/usr/bin/loginctl".into(),
+            systemd_run: "/usr/bin/systemd-run".into(),
+            systemctl: "/usr/bin/systemctl".into(),
+            env: "/usr/bin/env".into(),
             timeout: Duration::from_secs(60),
         }
     }
@@ -256,9 +262,9 @@ pub fn approve_read(
         "desktop user manager unavailable"
     );
     let agent = trusted_executable(&config.approval_agent)?;
-    let runner = trusted_executable(Path::new("/usr/bin/systemd-run"))?;
-    let systemctl = trusted_executable(Path::new("/usr/bin/systemctl"))?;
-    let env = trusted_executable(Path::new("/usr/bin/env"))?;
+    let runner = trusted_executable(&config.systemd_run)?;
+    let systemctl = trusted_executable(&config.systemctl)?;
+    let env = trusted_executable(&config.env)?;
     let pkcheck = trusted_executable(&config.pkcheck)?;
     let request_id = request_id()?;
     let unit = format!("agent-keyring-approval-{request_id}.service");
@@ -699,6 +705,7 @@ struct Session {
     leader: i32,
     leader_start: u64,
     display: String,
+    wayland: bool,
 }
 
 fn properties(text: &str) -> Result<HashMap<&str, &str>> {
@@ -734,8 +741,8 @@ fn parse_session(id: &str, text: &str, uid: u32) -> Result<Session> {
         "desktop must be local, active and unlocked"
     );
     ensure!(
-        p.get("Type") == Some(&"x11"),
-        "an X11 desktop session is required"
+        matches!(p.get("Type"), Some(&"x11") | Some(&"wayland")),
+        "an X11 or Wayland desktop session is required"
     );
     let leader: i32 = p.get("Leader").context("session leader missing")?.parse()?;
     ensure!(leader > 0, "invalid session leader");
@@ -753,6 +760,7 @@ fn parse_session(id: &str, text: &str, uid: u32) -> Result<Session> {
         leader,
         leader_start: 0,
         display,
+        wayland: p.get("Type") == Some(&"wayland"),
     })
 }
 
@@ -882,11 +890,33 @@ fn desktop_environment(
         &PathBuf::from(format!("/proc/{}/environ", subject.pid)),
         PROC_LIMIT,
     )?;
+    verify_subject(subject)?;
+    desktop_environment_from_data(subject, session, account, &data)
+}
+
+fn desktop_environment_from_data(
+    subject: &Subject,
+    session: &Session,
+    account: &Account,
+    data: &[u8],
+) -> Result<Vec<(OsString, OsString)>> {
     let mut display = None;
     let mut authority = None;
+    let mut wayland = None;
+    let mut runtime_dir = None;
+    let mut session_hint = None;
     // Do not decode, forward, or log unrelated environment variables.
     for entry in data.split(|b| *b == 0) {
-        if let Some(value) = entry.strip_prefix(b"DISPLAY=") {
+        if let Some(value) = entry.strip_prefix(b"XDG_SESSION_ID=") {
+            ensure!(session_hint.is_none(), "duplicate subject XDG_SESSION_ID");
+            session_hint = Some(std::str::from_utf8(value)?.to_owned());
+        } else if let Some(value) = entry.strip_prefix(b"WAYLAND_DISPLAY=") {
+            ensure!(wayland.is_none(), "duplicate subject WAYLAND_DISPLAY");
+            wayland = Some(PathBuf::from(OsString::from_vec(value.to_vec())));
+        } else if let Some(value) = entry.strip_prefix(b"XDG_RUNTIME_DIR=") {
+            ensure!(runtime_dir.is_none(), "duplicate subject XDG_RUNTIME_DIR");
+            runtime_dir = Some(PathBuf::from(OsString::from_vec(value.to_vec())));
+        } else if let Some(value) = entry.strip_prefix(b"DISPLAY=") {
             ensure!(display.is_none(), "duplicate subject DISPLAY");
             display = Some(std::str::from_utf8(value)?.to_owned());
         } else if let Some(value) = entry.strip_prefix(b"XAUTHORITY=") {
@@ -894,7 +924,32 @@ fn desktop_environment(
             authority = Some(PathBuf::from(OsString::from_vec(value.to_vec())));
         }
     }
-    verify_subject(subject)?;
+    ensure!(session.uid == subject.uid, "wrong desktop user");
+    if let Some(id) = session_hint {
+        ensure!(id == session.id, "subject desktop differs from logind");
+    }
+    if session.wayland {
+        let runtime = PathBuf::from(format!("/run/user/{}", subject.uid));
+        let socket = wayland_socket(
+            subject.uid,
+            &runtime,
+            &runtime_dir.context("subject has no runtime directory")?,
+            &wayland.context("subject has no Wayland display")?,
+        )?;
+        return Ok(vec![
+            ("HOME".into(), account.home.as_os_str().to_owned()),
+            ("XDG_DATA_DIRS".into(), desktop_data_dirs(&account.home)?),
+            ("USER".into(), account.name.clone()),
+            ("LOGNAME".into(), account.name.clone()),
+            ("XDG_RUNTIME_DIR".into(), runtime.as_os_str().to_owned()),
+            ("WAYLAND_DISPLAY".into(), socket.into_os_string()),
+            ("GDK_BACKEND".into(), "wayland".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                format!("unix:path={}/bus", runtime.display()).into(),
+            ),
+        ]);
+    }
     let display = if session.display.is_empty() {
         display.context("subject has no local display")?
     } else {
@@ -961,6 +1016,55 @@ fn desktop_environment(
         }
     }
     Ok(env)
+}
+
+/// The subject environment is a desktop hint, never an arbitrary endpoint.
+/// Like the X11 fallback, this trusts the same-UID host desktop, not its isolation.
+fn wayland_socket(
+    uid: u32,
+    runtime: &Path,
+    supplied_runtime: &Path,
+    display: &Path,
+) -> Result<PathBuf> {
+    ensure!(
+        supplied_runtime == runtime,
+        "wrong desktop runtime directory"
+    );
+    ensure!(
+        fs::canonicalize(runtime)? == runtime,
+        "runtime directory has symlink ancestors"
+    );
+    let meta = fs::symlink_metadata(runtime)?;
+    ensure!(
+        meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0,
+        "unsafe desktop runtime directory"
+    );
+    let name = if display.is_absolute() {
+        display
+            .strip_prefix(runtime)
+            .context("Wayland socket outside runtime directory")?
+    } else {
+        display
+    };
+    // A single literal component excludes traversal, nested directories and symlink parents.
+    ensure!(
+        name.components().count() == 1
+            && matches!(name.components().next(), Some(Component::Normal(_)))
+            && name.as_os_str() == name.file_name().context("invalid Wayland display")?,
+        "invalid Wayland display"
+    );
+    let socket = runtime.join(name);
+    let meta = fs::symlink_metadata(&socket).context("Wayland socket unavailable")?;
+    ensure!(
+        meta.file_type().is_socket() && meta.uid() == uid,
+        "unsafe Wayland socket"
+    );
+    let bus = fs::symlink_metadata(runtime.join("bus")).context("desktop bus unavailable")?;
+    ensure!(
+        bus.file_type().is_socket() && bus.uid() == uid,
+        "unsafe desktop bus"
+    );
+    Ok(socket)
 }
 
 fn trusted_helper_mode(mode: u32) -> bool {
@@ -1257,6 +1361,23 @@ fn drain(reader: &mut impl Read, output: &mut Vec<u8>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These subprocess fixtures use host coreutils, not production helper defaults.
+    // Resolve them on NixOS too; production still requires configured trusted paths.
+    fn host_test_tool(path: &Path) -> PathBuf {
+        if path.exists() {
+            return path.to_owned();
+        }
+        let name = path.file_name().unwrap();
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+            .expect("test tool must be installed")
+    }
+
+    fn clean_command(path: &Path) -> Command {
+        super::clean_command(&host_test_tool(path))
+    }
     use std::os::unix::fs::PermissionsExt;
 
     #[derive(Default)]
@@ -1971,7 +2092,7 @@ mod tests {
             ("LockedHint=no", "LockedHint=yes"),
             ("LockedHint=no\n", ""),
             ("Type=x11", "Type=tty"),
-            ("Type=x11", "Type=wayland"),
+            ("Type=x11", "Type=unspecified"),
             ("Leader=123", "Leader=0"),
             ("Display=", "Display=remote:0"),
         ] {
@@ -1983,6 +2104,114 @@ mod tests {
         assert!(parse_session("--all", session_text(), 1000).is_err());
         assert!(parse_session("62", &format!("{}Active=yes\n", session_text()), 1000).is_err());
         assert!(!session_id(""));
+    }
+
+    #[test]
+    fn wayland_session_requires_all_logind_checks() {
+        let text = session_text().replace("Type=x11", "Type=wayland");
+        assert!(parse_session("62", &text, 1000).unwrap().wayland);
+        for (old, new) in [
+            ("User=1000", "User=1001"),
+            ("Active=yes", "Active=no"),
+            ("Remote=no", "Remote=yes"),
+            ("LockedHint=no", "LockedHint=yes"),
+            ("LockedHint=no\n", ""),
+            ("Type=wayland", "Type=tty"),
+        ] {
+            assert!(parse_session("62", &text.replace(old, new), 1000).is_err());
+        }
+    }
+
+    #[test]
+    fn desktop_environment_never_falls_back_between_backends() {
+        let subject = Subject {
+            pid: 1,
+            uid: 1000,
+            start_time: 1,
+        };
+        let account = Account {
+            gid: 1000,
+            home: "/home/test".into(),
+            name: "test".into(),
+        };
+        let x11 = parse_session("62", session_text(), 1000).unwrap();
+        let wayland = parse_session(
+            "62",
+            &session_text().replace("Type=x11", "Type=wayland"),
+            1000,
+        )
+        .unwrap();
+        for data in [
+            b"DISPLAY=:1\0".as_slice(),
+            b"WAYLAND_DISPLAY=wayland-1\0".as_slice(),
+            b"WAYLAND_DISPLAY=wayland-1\0XDG_RUNTIME_DIR=/tmp\0".as_slice(),
+            b"WAYLAND_DISPLAY=wayland-1\0WAYLAND_DISPLAY=wayland-2\0".as_slice(),
+            b"XDG_SESSION_ID=other\0".as_slice(),
+        ] {
+            assert!(desktop_environment_from_data(&subject, &wayland, &account, data).is_err());
+        }
+        assert!(
+            desktop_environment_from_data(
+                &subject,
+                &x11,
+                &account,
+                b"WAYLAND_DISPLAY=wayland-1\0XDG_RUNTIME_DIR=/run/user/1000\0"
+            )
+            .is_err()
+        );
+        let other = Subject {
+            uid: 1001,
+            ..subject
+        };
+        assert!(desktop_environment_from_data(&other, &wayland, &account, b"").is_err());
+    }
+
+    #[test]
+    fn wayland_endpoints_are_private_owned_literal_sockets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path();
+        fs::set_permissions(runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let socket = runtime.join("wayland-1");
+        let _display = UnixListener::bind(&socket).unwrap();
+        let bus = runtime.join("bus");
+        let bus_listener = UnixListener::bind(&bus).unwrap();
+        for display in [Path::new("wayland-1"), socket.as_path()] {
+            assert_eq!(
+                wayland_socket(uid, runtime, runtime, display).unwrap(),
+                socket
+            );
+        }
+        for display in [
+            "",
+            ".",
+            "..",
+            "../wayland-1",
+            "sub/wayland-1",
+            "/tmp/wayland-1",
+            "missing",
+        ] {
+            assert!(wayland_socket(uid, runtime, runtime, Path::new(display)).is_err());
+        }
+        assert!(wayland_socket(uid + 1, runtime, runtime, Path::new("wayland-1")).is_err());
+        assert!(wayland_socket(uid, runtime, Path::new("/tmp"), Path::new("wayland-1")).is_err());
+        symlink(&socket, runtime.join("linked")).unwrap();
+        assert!(wayland_socket(uid, runtime, runtime, Path::new("linked")).is_err());
+        fs::write(runtime.join("regular"), b"").unwrap();
+        assert!(wayland_socket(uid, runtime, runtime, Path::new("regular")).is_err());
+        fs::set_permissions(runtime, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(wayland_socket(uid, runtime, runtime, Path::new("wayland-1")).is_err());
+        fs::set_permissions(runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(bus_listener);
+        fs::remove_file(&bus).unwrap();
+        assert!(wayland_socket(uid, runtime, runtime, Path::new("wayland-1")).is_err());
+        symlink(&socket, &bus).unwrap();
+        assert!(wayland_socket(uid, runtime, runtime, Path::new("wayland-1")).is_err());
+        let alias = runtime.join("runtime-alias");
+        symlink(runtime, &alias).unwrap();
+        assert!(wayland_socket(uid, &alias, &alias, Path::new("wayland-1")).is_err());
     }
 
     #[test]
@@ -2116,8 +2345,9 @@ mod tests {
     #[test]
     fn installed_root_owned_helpers_are_accepted() {
         for path in ["/usr/bin/true", "/bin/true"] {
-            let resolved = trusted_executable(Path::new(path)).unwrap();
-            assert_eq!(resolved, fs::canonicalize(path).unwrap());
+            let path = host_test_tool(Path::new(path));
+            let resolved = trusted_executable(&path).unwrap();
+            assert_eq!(resolved, fs::canonicalize(&path).unwrap());
         }
     }
 

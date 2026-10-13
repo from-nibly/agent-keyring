@@ -104,8 +104,8 @@ conflict, 8 no supported live agent ancestor.
   and its host authentication helper). A normal desktop authentication agent is
   still useful for installation through `pkexec` and replacement/deletion.
 - The native `agent-keyring-approval` GUI, GTK3/libpolkit-agent, and an active
-  local X11 desktop session for new approvals. New approvals in Wayland-only,
-  remote, or headless sessions fail closed; already-approved run grants follow
+  local unlocked X11 or native Wayland desktop session for new approvals.
+  Remote, inactive, locked, or headless sessions fail closed; already-approved run grants follow
   the lifetime described above.
 - Root installation of the system service and polkit policy. A user service
   alone cannot enforce ownership of the vault or authorization state.
@@ -130,9 +130,37 @@ the GUI against the host's existing polkit helper rather than NixOS's
 desktop authentication agent for other operations. Neither installs a new setuid
 helper. Retain Nix-built packages in your profile while the daemon uses them.
 
+On NixOS, use a native root system service and install the three policy actions
+from `share/agent-keyring/io.github.from-nibly.agent-keyring.policy` through the
+system polkit configuration. The imperative installer targets FHS hosts, not
+NixOS. Configure absolute trusted store/system paths with daemon flags
+`--approval-agent`, `--pkcheck`, `--loginctl`, `--systemd-run`, `--systemctl`, and
+`--env`. All helpers are checked for root ownership and non-writable ancestors,
+including every symlink hop; user profiles are not privileged helper paths.
+Build the GUI against NixOS's actual host polkit authentication helper (normally
+`/run/wrappers/bin`), not the Debian/Ubuntu default `/usr/lib/polkit-1`.
+Keep the root vault directory mode 0700 and database mode 0600; no migration or
+secret import is required. Native module/packaging is owned by the integrator.
+
+Wayland uses only the verified subject's `WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR`, never environment supplied in a client request. Runtime must
+be the canonical private UID-owned `/run/user/UID`; the display must name a
+literal direct UID-owned socket inside it, and the session bus must also be an
+owned socket. An available `XDG_SESSION_ID` must match the active logind desktop.
+Only allowlisted GUI environment is forwarded, with `GDK_BACKEND=wayland`; there
+is no XWayland fallback. X11 retains validated DISPLAY/XAUTHORITY and
+`GDK_BACKEND=x11`. Neither logind nor these filesystem checks attest which
+same-UID compositor owns a socket: the host desktop and same-UID processes are
+trusted, as for the existing X11 fallback.
+GTK3's program name/app_id is `AgentKeyringApproval`; use that for native Wayland
+floating rules and retain that WM_CLASS for X11. Confirm compositor metadata
+in the operator-controlled [native Wayland acceptance](gui/TESTING.md).
+
 The daemon keeps `NoNewPrivileges=true`. It starts the approval GUI as an
 ordinary-user transient service through the existing user manager, outside that
-inherited restriction so the standard host polkit helper can authenticate. The
+inherited restriction so the standard host polkit helper can authenticate.
+The ordinary-user GUI deliberately does **not** have NoNewPrivileges enabled;
+requiring it would prevent the authentication helper from elevating. The
 GUI registers only for the requesting CLI process, leaving the normal desktop
 agent alone. Missing manager/registration, invalid protocol, or failed cleanup
 fails closed; there is no application fallback to a second dialog. The user

@@ -57,6 +57,12 @@ enum Command {
         pkcheck: PathBuf,
         #[arg(long, default_value = "/usr/bin/loginctl")]
         loginctl: PathBuf,
+        #[arg(long, default_value = "/usr/bin/systemd-run")]
+        systemd_run: PathBuf,
+        #[arg(long, default_value = "/usr/bin/systemctl")]
+        systemctl: PathBuf,
+        #[arg(long, default_value = "/usr/bin/env")]
+        env: PathBuf,
     },
 }
 
@@ -76,6 +82,9 @@ fn run(cli: Cli) -> Result<u8> {
         approval_agent,
         pkcheck,
         loginctl,
+        systemd_run,
+        systemctl,
+        env,
     } = &cli.command
     {
         return daemon::run(daemon::Config {
@@ -85,6 +94,9 @@ fn run(cli: Cli) -> Result<u8> {
                 approval_agent: approval_agent.clone(),
                 pkcheck: pkcheck.clone(),
                 loginctl: loginctl.clone(),
+                systemd_run: systemd_run.clone(),
+                systemctl: systemctl.clone(),
+                env: env.clone(),
                 timeout: std::time::Duration::from_secs(60),
             },
         })

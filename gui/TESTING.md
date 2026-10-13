@@ -97,3 +97,41 @@ claim is made that an authority-routing race can never show the global desktop
 agent. Keep the real synthetic-secret desktop integration gate before release:
 these tests intentionally do not validate actual registration, user-manager
 launch, host PAM, or global-agent coexistence.
+
+## Operator-controlled native Wayland acceptance (0.3.0)
+
+Xvfb proves only the X11 widget branch. Rust tests use temporary UNIX sockets,
+not a compositor, and do not prove GTK Wayland or polkit/PAM integration.
+Native Wayland acceptance remains unverified until an operator performs it.
+Do not automate a live lock, logout, compositor/session restart, or suspend;
+each disruptive check needs fresh explicit operator approval.
+
+On an already active, local, unlocked Wayland session with an existing user
+manager and the host's real polkit helper:
+
+1. Install reviewed native packaging/policy and configured trusted tool paths.
+   Preserve root daemon `NoNewPrivileges=true`, requester-UID GUI service without
+   NNP, and root vault 0700/database 0600. Do not import, delete or migrate secrets.
+2. Use an operator-designated non-sensitive test key and a real supported agent
+   topology. Confirm the subject has the correct `/run/user/UID` runtime and
+   compositor socket. A missing subject Wayland environment must fail closed,
+   even if the user manager has its own usable environment.
+3. Request approval; inspect Hyprland's window metadata while it is visible.
+   Confirm native Wayland (not XWayland), app_id/class `AgentKeyringApproval`, one
+   window, readable metadata and an effective floating rule for that app_id.
+   X11 separately retains WM_CLASS `AgentKeyringApproval` and `GDK_BACKEND=x11`.
+4. Exercise Cancel, window close, bad password, Once, Run, and rapid scope changes.
+   Only the daemon's current exact polkit check may grant access; a stale success,
+   unrelated action or dialog output must never suffice. Confirm process exit,
+   unrelated agents and revocation retain existing process-scoped behavior.
+5. Confirm deadline/cancellation cleanup removes the exact transient unit and
+   all GUI/PAM descendants, leaves the global desktop agent registered, and
+   leaves the root daemon running with NNP. A cleanup failure must retain the
+   per-UID prompt fence rather than open another approval.
+6. Test missing/bad runtime, socket and environment using isolated fixtures, not
+   by modifying live compositor sockets. Rust covers UID mismatch and
+   remote/locked/inactive/unsupported session properties; an actual lock/unlock
+   or remote-session gate is a separate explicitly authorized operator check.
+
+Record compositor/GTK/polkit/systemd versions and what actually passed. Do not
+label a package build or Xvfb run as native Wayland acceptance.

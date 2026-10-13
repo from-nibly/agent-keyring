@@ -715,7 +715,7 @@ int main(int argc, char **argv)
     gint output_fd = harden_process();
     Options options;
     if (output_fd < 0) return 1;
-    /* GTK derives the X11 class from the program name again during init. */
+    /* GTK uses this name for native Wayland app_id and the X11 class at init. */
     g_set_prgname("AgentKeyringApproval");
     gdk_set_program_class("AgentKeyringApproval");
     if (!parse_options(argc, argv, &options) || getuid() == 0 ||

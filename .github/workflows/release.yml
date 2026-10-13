@@ -50,14 +50,16 @@ jobs:
             exit 1
           fi
           package="agent-keyring-v${version}-x86_64-unknown-linux-musl"
-          mkdir -p "dist/$package/"{bin,libexec,share,gui,nix,docs}
+          mkdir -p "dist/$package/"{bin,libexec,share,gui,nix,docs,src,scripts}
           install -m755 target/x86_64-unknown-linux-musl/release/agent-keyring "dist/$package/bin/agent-keyring"
           install -m755 scripts/install-system.sh "dist/$package/bin/agent-keyring-install-system"
           install -m755 gui/agent-keyring-approval "dist/$package/libexec/agent-keyring-approval"
           cp gui/approval.c gui/test-approval.c gui/Makefile gui/TESTING.md "dist/$package/gui/"
           cp nix/approval-agent.nix nix/host-polkit.nix nix/polkit-agent.nix "dist/$package/nix/"
           cp docs/approval-protocol.md docs/verification.md "dist/$package/docs/"
-          cp Cargo.toml "dist/$package/"
+          cp Cargo.toml Cargo.lock "dist/$package/"
+          cp src/*.rs "dist/$package/src/"
+          cp scripts/*.sh "dist/$package/scripts/"
           cp -R share/agent-keyring "dist/$package/share/agent-keyring"
           cp README.md LICENSE "dist/$package/"
           epoch=$(git log -1 --format=%ct)
