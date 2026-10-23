@@ -137,6 +137,10 @@ NixOS. Configure absolute trusted store/system paths with daemon flags
 `--approval-agent`, `--pkcheck`, `--loginctl`, `--systemd-run`, `--systemctl`, and
 `--env`. All helpers are checked for root ownership and non-writable ancestors,
 including every symlink hop; user profiles are not privileged helper paths.
+`--env` accepts a standalone `env` or Nix's standard `env` symlink to the GNU
+Coreutils multicall binary. After validating and resolving that path, the broker
+uses `coreutils --coreutils-prog=env -i` when the resolved executable is named
+`coreutils`; no separately compiled Coreutils variant is needed.
 Build the GUI against NixOS's actual host polkit authentication helper (normally
 `/run/wrappers/bin`), not the Debian/Ubuntu default `/usr/lib/polkit-1`.
 Keep the root vault directory mode 0700 and database mode 0600; no migration or

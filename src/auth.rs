@@ -395,10 +395,13 @@ fn approval_command(
         "--property=UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_PROFILE LD_ORIGIN_PATH LD_ASSUME_KERNEL LD_DYNAMIC_WEAK LD_BIND_NOW LD_BIND_NOT LD_HWCAP_MASK LD_SHOW_AUXV LD_USE_LOAD_BIAS GLIBC_TUNABLES GCONV_PATH LOCPATH POLKIT_DEBUG",
     ]);
     command.arg(format!("--property=RuntimeMaxSec={timeout}s"));
-    command
-        .arg("--")
-        .arg(env)
-        .args(["-i", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "PATH=/usr/bin:/bin"]);
+    command.arg("--").arg(env);
+    // Trusted-path resolution turns Nix's env symlink into the multicall binary.
+    // Select the applet explicitly instead of executing the unresolved symlink.
+    if env.file_name() == Some(std::ffi::OsStr::new("coreutils")) {
+        command.arg("--coreutils-prog=env");
+    }
+    command.args(["-i", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "PATH=/usr/bin:/bin"]);
     for (name, value) in environment {
         let mut assignment = name.clone();
         assignment.push("=");
@@ -1739,6 +1742,88 @@ mod tests {
             ]
         );
         assert_eq!(command.get_current_dir(), Some(Path::new("/")));
+    }
+
+    #[test]
+    fn multicall_env_dispatch_is_explicit() {
+        let env = Path::new("/nix/store/test-coreutils/bin/coreutils");
+        let command = approval_command(
+            Path::new("/usr/bin/systemd-run"),
+            env,
+            Path::new("/trusted/agent"),
+            &Subject {
+                pid: 42,
+                uid: 1000,
+                start_time: 123,
+            },
+            &[],
+            "test.service",
+            "0123456789abcdef0123456789abcdef",
+            "once",
+            "run",
+            60,
+        );
+        let args: Vec<_> = command.get_args().collect();
+        let start = args.iter().position(|arg| *arg == "--").unwrap();
+        assert_eq!(
+            &args[start + 1..start + 7],
+            [
+                env.as_os_str(),
+                "--coreutils-prog=env".as_ref(),
+                "-i".as_ref(),
+                "LANG=C.UTF-8".as_ref(),
+                "LC_ALL=C.UTF-8".as_ref(),
+                "PATH=/usr/bin:/bin".as_ref()
+            ]
+        );
+        assert_eq!(args[start + 7], "/trusted/agent");
+    }
+
+    #[test]
+    fn resolved_env_helper_clears_inherited_environment() {
+        let env = host_test_tool(Path::new("/usr/bin/env"));
+        let resolved = trusted_executable(&env).unwrap();
+        let command = approval_command(
+            Path::new("/usr/bin/systemd-run"),
+            &resolved,
+            Path::new("/trusted/agent"),
+            &Subject {
+                pid: 42,
+                uid: 1000,
+                start_time: 123,
+            },
+            &[("HOME".into(), "/home/literal $ %".into())],
+            "test.service",
+            "0123456789abcdef0123456789abcdef",
+            "once",
+            "run",
+            60,
+        );
+        // Execute only the generated env prefix, never a user service or GUI.
+        let mut args = command.get_args().skip_while(|arg| *arg != "--").skip(1);
+        let program = args.next().unwrap();
+        let output = Command::new(program)
+            .args(args.take_while(|arg| *arg != "/trusted/agent"))
+            .arg(env)
+            .env("AGENT_KEYRING_TEST_UNSAFE", "must not leak")
+            .env("LD_LIBRARY_PATH", "/must-not-leak")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let mut actual: Vec<_> = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            [
+                "HOME=/home/literal $ %",
+                "LANG=C.UTF-8",
+                "LC_ALL=C.UTF-8",
+                "PATH=/usr/bin:/bin"
+            ]
+        );
     }
 
     #[test]
